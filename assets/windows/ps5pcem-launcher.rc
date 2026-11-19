@@ -19,13 +19,13 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "PS5PCEM Project\0"
-            VALUE "FileDescription", "PS5PCEM Launcher\0"
+            VALUE "CompanyName", "NEXORA Project\0"
+            VALUE "FileDescription", "NEXORA Launcher\0"
             VALUE "FileVersion", "0.3.6\0"
-            VALUE "InternalName", "ps5pcem\0"
+            VALUE "InternalName", "NEXORA\0"
             VALUE "LegalCopyright", "Copyright (C) 2026 Artur Strazewicz\0"
-            VALUE "OriginalFilename", "ps5pcem.exe\0"
-            VALUE "ProductName", "PS5PCEM\0"
+            VALUE "OriginalFilename", "NEXORA.exe\0"
+            VALUE "ProductName", "NEXORA\0"
             VALUE "ProductVersion", "0.3.6\0"
         END
     END
