@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Artur Strazewicz
 
-//! Native Windows launcher for PS5PCEM.
+//! Native Windows launcher for NEXORA.
 //!
 //! The interface deliberately uses only Win32/GDI so the emulator keeps its
 //! zero-dependency build. Settings are persisted next to the executable and
@@ -22,14 +22,14 @@ comptime {
     @setEvalBranchQuota(20_000);
 }
 
-const site_url = "https://ps5pcem.com";
+const site_url = "https://github.com/bz1kie/NEXORA";
 /// Where a newer release is downloaded. `latest` redirects to the newest
 /// published release; the API below reports the same one.
-const releases_url = "https://github.com/iStark/PS5PCEM/releases/latest";
+const releases_url = "https://github.com/bz1kie/NEXORA/releases/latest";
 const latest_release_host = "api.github.com";
-const latest_release_path = "/repos/iStark/PS5PCEM/releases/latest";
-const github_url = "https://github.com/iStark/PS5PCEM";
-const znosin_url = "https://znosin.com/c/ps5pcem";
+const latest_release_path = "/repos/bz1kie/NEXORA/releases/latest";
+const github_url = "https://github.com/bz1kie/NEXORA";
+const znosin_url = "https://github.com/bz1kie/NEXORA";
 const window_width = 1180;
 const window_height = 760;
 const sidebar_width = 222;
@@ -242,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
         .cursor = Win32.LoadCursorW(null, Win32.arrow_cursor),
         .background = null,
         .menu_name = null,
-        .class_name = w("PS5PCEM_LAUNCHER"),
+        .class_name = w("NEXORA_LAUNCHER"),
         .small_icon = application_icon,
     };
     if (Win32.RegisterClassExW(&class) == 0 and Win32.GetLastError() != Win32.error_class_already_exists) {
@@ -257,8 +257,8 @@ pub fn main(init: std.process.Init) !void {
     _ = Win32.AdjustWindowRect(&outer, Win32.window_style, 0);
     const window = Win32.CreateWindowExW(
         0,
-        w("PS5PCEM_LAUNCHER"),
-        w("PS5PCEM — Launcher"),
+        w("NEXORA_LAUNCHER"),
+        w("NEXORA — Launcher"),
         Win32.window_style,
         Win32.centered,
         Win32.centered,
@@ -1141,7 +1141,7 @@ fn drawBrand(dc: Win32.DeviceContext) void {
     // The 27-pixel title needs a cell about 36 pixels tall; the old 25-pixel
     // one sliced the bottom off every glyph. Both lines are sized for their
     // font and the pair is centred against the 44-pixel icon beside them.
-    text(dc, w("PS5PCEM"), -1, .{ .left = 80, .top = 26, .right = 216, .bottom = 62 }, 0x00f4f0ea, title_font, Win32.dt_left);
+    text(dc, w("NEXORA"), -1, .{ .left = 80, .top = 26, .right = 216, .bottom = 62 }, 0x00f4f0ea, title_font, Win32.dt_left);
     // The sidebar leaves 136 pixels beside the icon, which "LAUNCHER ·
     // PREVIEW" overran: it was drawn cut off mid-word. The window title
     // already says this is the launcher, so the line only has to say which
@@ -1160,7 +1160,7 @@ fn drawNavigation(dc: Win32.DeviceContext) void {
     roundFill(dc, .{ .left = 20, .top = 626, .right = 202, .bottom = 670 }, 10, 0x003d3029);
     text(dc, w("Znosin  ↗"), -1, .{ .left = 32, .top = 636, .right = 192, .bottom = 662 }, 0x00ffac64, regular_font, Win32.dt_left);
     text(dc, w("GitHub · iStark  ↗"), -1, .{ .left = 28, .top = 690, .right = 198, .bottom = 716 }, 0x00b9afa8, regular_font, Win32.dt_left);
-    text(dc, w("ps5pcem.com  ↗"), -1, .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, regular_font, Win32.dt_left);
+    text(dc, w("github.com/bz1kie/NEXORA  ↗"), -1, .{ .left = 28, .top = 588, .right = 198, .bottom = 612 }, 0x00ffac64, regular_font, Win32.dt_left);
 }
 
 /// Says what the probe found, in the place that used to assert success.
@@ -2168,7 +2168,7 @@ fn drawSettings(dc: Win32.DeviceContext) void {
     localizedText(dc, .graphics_api_description, .{ .left = 660, .top = 572, .right = 1066, .bottom = 637 }, 0x00aaa098, small_font, Win32.dt_left | Win32.dt_word_break);
 
     card(dc, .{ .left = 282, .top = 650, .right = 1086, .bottom = 714 });
-    text(dc, w("PS5PCEM"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
+    text(dc, w("NEXORA"), -1, .{ .left = 310, .top = 654, .right = 500, .bottom = 680 }, 0x00f4f0ea, medium_font, Win32.dt_left);
     localizedText(dc, .author, .{ .left = 310, .top = 684, .right = 840, .bottom = 708 }, 0x00ffac64, regular_font, Win32.dt_left | Win32.dt_end_ellipsis);
     text(dc, w("GPL-3.0-or-later"), -1, .{ .left = 860, .top = 684, .right = 1048, .bottom = 708 }, 0x008b817a, regular_font, Win32.dt_right);
 }
@@ -2903,7 +2903,7 @@ fn checkLatestRelease(window: Win32.Window) void {
 }
 
 fn fetchLatestReleaseTag() bool {
-    const session = Win32.WinHttpOpen(w("PS5PCEM-Launcher/" ++ build_options.release_version), Win32.winhttp_automatic_proxy, null, null, 0) orelse return false;
+    const session = Win32.WinHttpOpen(w("NEXORA-Launcher/" ++ build_options.release_version), Win32.winhttp_automatic_proxy, null, null, 0) orelse return false;
     defer _ = Win32.WinHttpCloseHandle(session);
     _ = Win32.WinHttpSetTimeouts(session, 10_000, 10_000, 10_000, 10_000);
     const connection = Win32.WinHttpConnect(session, w(latest_release_host), 443, 0) orelse return false;
@@ -3030,7 +3030,7 @@ fn initializeIniPath() void {
     ini_path_length = Win32.GetModuleFileNameW(null, &ini_path, ini_path.len);
     if (ini_path_length == 0 or ini_path_length >= ini_path.len) return;
     while (ini_path_length > 0 and ini_path[ini_path_length - 1] != '\\') : (ini_path_length -= 1) {}
-    const name = w("ps5pcem.ini");
+    const name = w("nexora.ini");
     const name_length = wideLength(name);
     if (ini_path_length + name_length >= ini_path.len) return;
     @memcpy(ini_path[ini_path_length..][0..name_length], name[0..name_length]);
