@@ -1,27 +1,39 @@
 # NEXORA
 
-Experimental PlayStation 5 emulator project based on [PS5PCEM](https://github.com/iStark/PS5PCEM).
+**NEXORA** is an experimental PlayStation 5 emulator for Windows x64.
+The Windows build produces a graphical `NEXORA.exe` launcher. Game
+compatibility and real-world performance are **not yet verified**.
 
-> **Status:** experimental development. The upstream PS5PCEM source and Git history were imported into the `import/ps5pcem-upstream-44485557126` branch. A verified NEXORA emulator build is still pending.
+## Windows portable build
 
-## Development approach
+1. Open [NEXORA Windows builds](https://github.com/bz1kie/NEXORA/actions/workflows/nexora-windows.yml).
+2. Open the latest successful workflow run on the development branch.
+3. Download the `NEXORA-windows-x64-portable` artifact (GitHub sign-in may be required).
+4. Extract the ZIP to a folder. Keep `NEXORA.exe`, `game-run.exe`, and all
+   companion files in the same directory.
+5. Run `NEXORA.exe`.
 
-1. Preserve the imported upstream PS5PCEM Git history, source code, copyright notices, and GPL-3.0-or-later license.
-2. Keep the original emulator architecture operational and establish repeatable baseline benchmarks.
-3. Add CPU/GPU frame profiling and regression tests.
-4. Incrementally optimize shader translation, Vulkan rendering, memory management, and HLE behavior.
+This is a development build, not a signed installer. Windows may show a
+SmartScreen warning for an unsigned experimental executable. Do not download
+builds from untrusted mirrors.
 
-## Phase 1 — profiling utilities
+## Development
 
-The `tools/profile_analyze.py` script consumes frame-time CSV and emits repeatable summary metrics. Example:
+The source is built with Zig 0.16.0. Windows CI runs
+`zig build -Doptimize=ReleaseSafe` and checks that both required executables
+are present. The portable ZIP is produced from `zig-out/bin`.
 
-```bash
-python tools/profile_analyze.py path/to/frames.csv
-python -m unittest discover -s tests -v
-```
+The frame profiling module records guest flip intervals. Its CSV export API
+is integrated in the renderer, but no user-facing CSV export button is
+available yet. See [frame timing notes](docs/FRAME_TIMING.md).
 
-## License and attribution
+## License and acknowledgments
 
-NEXORA is intended as a modified version of PS5PCEM. Upstream PS5PCEM is licensed under **GPL-3.0-or-later**. Retain upstream copyright and license notices when importing its code. Do not remove attribution. The NEXORA-specific code in this repository is also offered under **GPL-3.0-or-later**.
+NEXORA is a modified version of the open-source PS5PCEM project by its
+respective contributors, distributed under **GPL-3.0-or-later**.
+Original copyright notices and required attribution are retained.
+The original upstream project is available at
+https://github.com/iStark/PS5PCEM.
 
-Upstream: https://github.com/iStark/PS5PCEM
+The NEXORA-specific modifications are also distributed under
+**GPL-3.0-or-later**. See [LICENSE](LICENSE).
