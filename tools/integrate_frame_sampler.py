@@ -12,10 +12,10 @@ replacements = [
     ),
     (
         "    /// Selects the registered display-buffer allocation named by a flip.",
-        "    /// Export captured guest flip intervals as frame_ms CSV.\\n"
-        "    pub fn writeNexoraFrameCsv(self: *const Renderer, writer: anytype) !void {\\n"
-        "        try self.nexora_frame_sampler.writeCsv(writer);\\n"
-        "    }\\n\\n"
+        "    /// Export captured guest flip intervals as frame_ms CSV.\n"
+        "    pub fn writeNexoraFrameCsv(self: *const Renderer, writer: anytype) !void {\n"
+        "        try self.nexora_frame_sampler.writeCsv(writer);\n"
+        "    }\n\n"
         "    /// Selects the registered display-buffer allocation named by a flip.",
     ),
     (
