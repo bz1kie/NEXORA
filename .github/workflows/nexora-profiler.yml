@@ -5,7 +5,9 @@ on:
     branches: [feature/nexora-build-baseline]
     paths:
       - 'tools/profile_analyze.py'
+      - 'tools/gpu_wait_audit.py'
       - 'tests/test_profile_analyze.py'
+      - 'tests/test_gpu_wait_audit.py'
       - 'samples/frames.csv'
       - '.github/workflows/nexora-profiler.yml'
   pull_request:
@@ -26,10 +28,14 @@ jobs:
         with:
           python-version: '3.12'
       - name: Unit tests
-        run: python -m unittest discover -s tests -p 'test_profile_analyze.py' -v
+        run: python -m unittest discover -s tests -p 'test_*audit.py' -v && python -m unittest discover -s tests -p 'test_profile_analyze.py' -v
+      - name: Static GPU wait inventory
+        run: python tools/gpu_wait_audit.py src --out gpu-wait-sites.json
       - name: Sample frame report
         run: python tools/profile_analyze.py samples/frames.csv --out frame-report.json
       - uses: actions/upload-artifact@v4
         with:
           name: frame-report-${{ matrix.os }}
-          path: frame-report.json
+          path: |
+            frame-report.json
+            gpu-wait-sites.json
