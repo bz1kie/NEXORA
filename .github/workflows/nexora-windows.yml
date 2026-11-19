@@ -36,11 +36,31 @@ jobs:
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Compress-Archive -Path 'zig-out/bin/*' -DestinationPath 'dist/NEXORA-windows-x64-portable.zip' -Force
           if (!(Test-Path 'dist/NEXORA-windows-x64-portable.zip')) { throw 'Portable ZIP missing' }
+      - name: Verify portable ZIP contents and SHA256
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression
+          $zipPath = (Resolve-Path 'dist/NEXORA-windows-x64-portable.zip').Path
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName })
+            foreach ($required in @('NEXORA.exe', 'game-run.exe')) {
+              if ($entries -notcontains $required) { throw "Portable ZIP missing $required" }
+            }
+            Write-Host "Validated $($entries.Count) ZIP entries"
+          } finally {
+            $archive.Dispose()
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $zipPath).Hash.ToLowerInvariant()
+          "$hash  NEXORA-windows-x64-portable.zip" | Set-Content -Path 'dist/SHA256SUMS.txt' -Encoding ascii
+          Write-Host "SHA256: $hash"
       - name: Upload portable ZIP
         uses: actions/upload-artifact@v4
         with:
           name: NEXORA-windows-x64-portable
-          path: dist/NEXORA-windows-x64-portable.zip
+          path: |
+            dist/NEXORA-windows-x64-portable.zip
+            dist/SHA256SUMS.txt
           if-no-files-found: error
           retention-days: 14
       - name: Upload Windows binaries
