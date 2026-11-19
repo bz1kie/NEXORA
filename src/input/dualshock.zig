@@ -1,0 +1,681 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Input reports of Sony's own controllers.
+//!
+//! XInput cannot see these pads at all. It only enumerates Xbox-compatible
+//! devices, so a DualSense or DualShock 4 plugged straight into the host is
+//! invisible to it and appears connected only when a translation layer puts a
+//! virtual Xbox pad in front of it. Reading the HID reports directly is what
+//! makes the controller the title expects work without one.
+//!
+//! Parsing is kept apart from the host I/O so the byte layouts can be tested
+//! without a device attached.
+
+const std = @import("std");
+
+pub const sony_vendor: u16 = 0x054c;
+
+pub const Family = enum { dual_sense, dual_shock_4 };
+
+/// Identifies a pad this module can read. Unknown products are rejected rather
+/// than guessed at: a wrong layout produces plausible-looking axes that respond
+/// to nothing, which is harder to recognize than an unsupported device.
+pub fn identify(vendor: u16, product: u16) ?Family {
+    if (vendor != sony_vendor) return null;
+    return switch (product) {
+        // DualSense, and the Edge revision that reports the same layout.
+        0x0ce6, 0x0df2 => .dual_sense,
+        // DualShock 4, first and second hardware revisions.
+        0x05c4, 0x09cc => .dual_shock_4,
+        else => null,
+    };
+}
+
+/// One sampled controller state, in the units the reports carry: sticks are
+/// unsigned with 128 at rest and Y growing downwards, triggers are 0..255.
+pub const Pad = struct {
+    cross: bool = false,
+    circle: bool = false,
+    square: bool = false,
+    triangle: bool = false,
+    l1: bool = false,
+    r1: bool = false,
+    l2: bool = false,
+    r2: bool = false,
+    l3: bool = false,
+    r3: bool = false,
+    options: bool = false,
+    create: bool = false,
+    touch_pad: bool = false,
+    home: bool = false,
+    up: bool = false,
+    right: bool = false,
+    down: bool = false,
+    left: bool = false,
+    left_x: u8 = 128,
+    left_y: u8 = 128,
+    right_x: u8 = 128,
+    right_y: u8 = 128,
+    analog_l2: u8 = 0,
+    analog_r2: u8 = 0,
+    /// Present when the report carries the inertial sensors.
+    motion: ?RawMotion = null,
+};
+
+/// Gyroscope and accelerometer counts on the pad's own axes (X right, Y up,
+/// Z towards the player), stamped with the pad's free-running sensor clock.
+pub const RawMotion = struct {
+    gyro: [3]i16,
+    accel: [3]i16,
+    timestamp: u32,
+};
+
+/// Where the sensors sit in a report that carries them. The six gyroscope
+/// and accelerometer words are adjacent; the clock is placed differently.
+const MotionLayout = struct {
+    gyro: usize,
+    timestamp: usize,
+    timestamp_bytes: usize,
+
+    fn minimumLength(self: MotionLayout) usize {
+        return @max(self.gyro + 12, self.timestamp + self.timestamp_bytes);
+    }
+};
+
+/// Where each field sits inside one report.
+///
+/// The fields themselves are identical across every form; only their offsets
+/// move, because Bluetooth prefixes the payload and because the DualSense
+/// carries its triggers ahead of the button bytes rather than after them.
+const Layout = struct {
+    left_x: usize,
+    left_y: usize,
+    right_x: usize,
+    right_y: usize,
+    buttons_face: usize,
+    buttons_shoulder: usize,
+    buttons_system: usize,
+    analog_l2: usize,
+    analog_r2: usize,
+    motion: ?MotionLayout = null,
+
+    fn minimumLength(self: Layout) usize {
+        var highest = self.buttons_system;
+        for ([_]usize{
+            self.left_x,    self.left_y,       self.right_x,
+            self.right_y,   self.buttons_face, self.buttons_shoulder,
+            self.analog_l2, self.analog_r2,
+        }) |offset| {
+            if (offset > highest) highest = offset;
+        }
+        return highest + 1;
+    }
+};
+
+/// The DualShock 4 order: both sticks, the three button bytes, then the
+/// analogue triggers. The DualSense repeats it verbatim in the compact report
+/// it sends over Bluetooth before a host asks for the full one.
+fn compactLayout(base: usize) Layout {
+    return .{
+        // Only the DualShock 4 form continues with a 16-bit sensor clock, a
+        // temperature byte and the sensors; see `withMotion`.
+        .left_x = base,
+        .left_y = base + 1,
+        .right_x = base + 2,
+        .right_y = base + 3,
+        .buttons_face = base + 4,
+        .buttons_shoulder = base + 5,
+        .buttons_system = base + 6,
+        .analog_l2 = base + 7,
+        .analog_r2 = base + 8,
+    };
+}
+
+/// The DualSense order: both sticks, the analogue triggers, a sequence counter,
+/// then the three button bytes.
+fn extendedLayout(base: usize) Layout {
+    return .{
+        .left_x = base,
+        .left_y = base + 1,
+        .right_x = base + 2,
+        .right_y = base + 3,
+        .analog_l2 = base + 4,
+        .analog_r2 = base + 5,
+        .buttons_face = base + 7,
+        .buttons_shoulder = base + 8,
+        .buttons_system = base + 9,
+        // A reserved word follows the buttons, then the sensors and a 32-bit
+        // clock.
+        .motion = .{ .gyro = base + 15, .timestamp = base + 27, .timestamp_bytes = 4 },
+    };
+}
+
+fn withMotion(layout: Layout, base: usize) Layout {
+    var result = layout;
+    result.motion = .{ .gyro = base + 12, .timestamp = base + 9, .timestamp_bytes = 2 };
+    return result;
+}
+
+/// The smallest DualSense report that still carries the full layout. Its
+/// Bluetooth compact form is far shorter, which is what separates the two
+/// meanings of report id 1 on that pad.
+const dual_sense_extended_length = 64;
+
+fn layoutFor(family: Family, report: []const u8) ?Layout {
+    if (report.len == 0) return null;
+    return switch (family) {
+        .dual_sense => switch (report[0]) {
+            // Wired, and the full Bluetooth report once the pad has been asked
+            // for it. Both start their payload immediately after the id.
+            0x01 => if (report.len >= dual_sense_extended_length)
+                extendedLayout(1)
+            else
+                // Until that request arrives the pad reports over Bluetooth in
+                // the older compact form.
+                compactLayout(1),
+            // The full Bluetooth report inserts one sequence byte first.
+            0x31 => extendedLayout(2),
+            else => null,
+        },
+        .dual_shock_4 => switch (report[0]) {
+            0x01 => withMotion(compactLayout(1), 1),
+            // Bluetooth prefixes two bytes before the wired payload.
+            0x11 => withMotion(compactLayout(3), 3),
+            else => null,
+        },
+    };
+}
+
+/// Decodes one host report, or reports that it is not one this module knows.
+pub fn parse(family: Family, report: []const u8) ?Pad {
+    const layout = layoutFor(family, report) orelse return null;
+    if (report.len < layout.minimumLength()) return null;
+
+    const face = report[layout.buttons_face];
+    const shoulder = report[layout.buttons_shoulder];
+    const system = report[layout.buttons_system];
+
+    var pad = Pad{
+        .left_x = report[layout.left_x],
+        .left_y = report[layout.left_y],
+        .right_x = report[layout.right_x],
+        .right_y = report[layout.right_y],
+        .analog_l2 = report[layout.analog_l2],
+        .analog_r2 = report[layout.analog_r2],
+        .square = face & 0x10 != 0,
+        .cross = face & 0x20 != 0,
+        .circle = face & 0x40 != 0,
+        .triangle = face & 0x80 != 0,
+        .l1 = shoulder & 0x01 != 0,
+        .r1 = shoulder & 0x02 != 0,
+        .l2 = shoulder & 0x04 != 0,
+        .r2 = shoulder & 0x08 != 0,
+        .create = shoulder & 0x10 != 0,
+        .options = shoulder & 0x20 != 0,
+        .l3 = shoulder & 0x40 != 0,
+        .r3 = shoulder & 0x80 != 0,
+        .home = system & 0x01 != 0,
+        .touch_pad = system & 0x02 != 0,
+    };
+    applyHat(&pad, face & 0x0f);
+    // A Bluetooth pad still on its short report simply has no sensors yet.
+    if (layout.motion) |motion| if (report.len >= motion.minimumLength()) {
+        var raw = RawMotion{ .gyro = undefined, .accel = undefined, .timestamp = 0 };
+        for (0..3) |axis| {
+            raw.gyro[axis] = std.mem.readInt(i16, report[motion.gyro + axis * 2 ..][0..2], .little);
+            raw.accel[axis] = std.mem.readInt(i16, report[motion.gyro + 6 + axis * 2 ..][0..2], .little);
+        }
+        raw.timestamp = if (motion.timestamp_bytes == 4)
+            std.mem.readInt(u32, report[motion.timestamp..][0..4], .little)
+        else
+            std.mem.readInt(u16, report[motion.timestamp..][0..2], .little);
+        pad.motion = raw;
+    };
+    return pad;
+}
+
+/// The directional pad arrives as one of eight compass positions rather than
+/// four independent bits, so the diagonals set two directions at once and any
+/// value past the last position means nothing is held.
+fn applyHat(pad: *Pad, hat: u8) void {
+    switch (hat) {
+        0 => pad.up = true,
+        1 => {
+            pad.up = true;
+            pad.right = true;
+        },
+        2 => pad.right = true,
+        3 => {
+            pad.right = true;
+            pad.down = true;
+        },
+        4 => pad.down = true,
+        5 => {
+            pad.down = true;
+            pad.left = true;
+        },
+        6 => pad.left = true,
+        7 => {
+            pad.left = true;
+            pad.up = true;
+        },
+        else => {},
+    }
+}
+
+/// How the pad is attached, which decides the shape of an outgoing report.
+///
+/// Bluetooth wraps the same payload: it shifts the fields along and appends a
+/// checksum the pad verifies before acting on anything, so a report built for
+/// the cable is silently ignored over the air.
+pub const Transport = enum { usb, bluetooth };
+
+/// The shortest output report either pad accepts over Bluetooth.
+pub const bluetooth_output_bytes = 78;
+
+/// Recovers the transport from the longest output report the host's HID stack
+/// declares for the pad.
+///
+/// The input reports cannot tell: a DualShock 4 on Bluetooth sends the same
+/// report id one as on the cable until it receives its first output report, and
+/// Windows pads every input report to the longest one the descriptor declares,
+/// so length does not separate the compact form either. The output side does:
+/// the cable descriptors stop at 32 (DualShock 4) and 48 (DualSense) bytes,
+/// while every Bluetooth descriptor carries at least the 78-byte effects report.
+pub fn transportFromOutputLength(output_length: usize) Transport {
+    return if (output_length >= bluetooth_output_bytes) .bluetooth else .usb;
+}
+
+/// What a host can drive on these pads without touching the advanced haptics.
+pub const Output = struct {
+    /// The large, low-frequency motor.
+    rumble_strong: u8 = 0,
+    /// The small, high-frequency motor.
+    rumble_weak: u8 = 0,
+    /// Light-only updates must not change motor or audio-haptics ownership.
+    set_motors: bool = true,
+    red: u8 = 0,
+    green: u8 = 0,
+    blue: u8 = 0,
+    /// Motor-only updates must leave the game's/current light-bar state alone.
+    set_light_bar: bool = true,
+    /// End DualSense's Bluetooth connection LED animation before setting RGB.
+    reset_light_bar: bool = false,
+    sequence: u4 = 0,
+};
+
+/// The longest report any of these forms needs.
+pub const maximum_output_bytes = 78;
+
+/// The byte the checksum is seeded with. It stands for the HID output-report
+/// message type and is not itself transmitted.
+const bluetooth_checksum_seed: u8 = 0xa2;
+
+/// Writes one output report into `buffer` and answers how much of it to send.
+pub fn buildOutput(
+    family: Family,
+    transport: Transport,
+    output: Output,
+    buffer: []u8,
+) ?usize {
+    const length: usize = switch (family) {
+        .dual_sense => if (transport == .usb) 48 else 78,
+        .dual_shock_4 => if (transport == .usb) 32 else 78,
+    };
+    if (buffer.len < length) return null;
+    @memset(buffer[0..length], 0);
+
+    switch (family) {
+        .dual_sense => {
+            const base: usize = if (transport == .usb) 1 else 3;
+            buffer[0] = if (transport == .usb) 0x02 else 0x31;
+            // Bluetooth carries a sequence tag ahead of the payload.
+            if (transport == .bluetooth) {
+                buffer[1] = @as(u8, output.sequence) << 4;
+                buffer[2] = 0x10;
+            }
+            // Ask for the plain motors rather than the haptic actuators, and
+            // for control of the light bar. A pad ignores every field whose
+            // enable bit is clear, so these are what make the rest take effect.
+            buffer[base] = if (output.set_motors) 0x03 else 0;
+            buffer[base + 1] = @as(u8, if (output.set_light_bar) 0x04 else 0) | @as(u8, if (output.reset_light_bar) 0x08 else 0);
+            buffer[base + 2] = output.rumble_weak;
+            buffer[base + 3] = output.rumble_strong;
+            buffer[base + 44] = output.red;
+            buffer[base + 45] = output.green;
+            buffer[base + 46] = output.blue;
+        },
+        .dual_shock_4 => {
+            const base: usize = if (transport == .usb) 1 else 3;
+            buffer[0] = if (transport == .usb) 0x05 else 0x11;
+            if (transport == .bluetooth) {
+                buffer[1] = 0xc0;
+                buffer[2] = 0xa0;
+            }
+            // Enable the motors, the light bar and its blink timers together.
+            buffer[base] = @as(u8, if (output.set_light_bar) 0xf6 else 0) | @as(u8, if (output.set_motors) 0x01 else 0);
+            buffer[base + 3] = output.rumble_weak;
+            buffer[base + 4] = output.rumble_strong;
+            buffer[base + 5] = output.red;
+            buffer[base + 6] = output.green;
+            buffer[base + 7] = output.blue;
+        },
+    }
+
+    if (transport == .bluetooth) appendChecksum(buffer[0..length]);
+    return length;
+}
+
+fn appendChecksum(report: []u8) void {
+    const body = report[0 .. report.len - 4];
+    var crc = std.hash.Crc32.init();
+    crc.update(&[_]u8{bluetooth_checksum_seed});
+    crc.update(body);
+    std.mem.writeInt(u32, report[report.len - 4 ..][0..4], crc.final(), .little);
+}
+
+/// DualSense's enhanced Bluetooth packet contains a 3 MHz connection timer.
+/// SDL waits for this threshold before resetting the connection LED animation.
+pub fn bluetoothLightBarReady(report: []const u8) bool {
+    return report.len >= 33 and report[0] == 0x31 and std.mem.readInt(u32, report[29..33], .little) >= 10_200_000;
+}
+
+test "light-only reports never enable motors and encode every RGB byte" {
+    for ([_]Family{ .dual_sense, .dual_shock_4 }) |family| {
+        for ([_]Transport{ .usb, .bluetooth }) |transport| {
+            var buffer: [maximum_output_bytes]u8 = undefined;
+            const base: usize = if (transport == .usb) 1 else 3;
+            for ([_][3]u8{ .{ 17, 99, 231 }, .{ 0, 0, 0 } }) |rgb| {
+                _ = buildOutput(family, transport, .{ .set_motors = false, .red = rgb[0], .green = rgb[1], .blue = rgb[2] }, &buffer);
+                if (family == .dual_sense) {
+                    try std.testing.expectEqual(@as(u8, 0), buffer[base]);
+                    try std.testing.expectEqual(@as(u8, 4), buffer[base + 1]);
+                    try std.testing.expectEqualSlices(u8, &rgb, buffer[base + 44 ..][0..3]);
+                } else {
+                    try std.testing.expectEqual(@as(u8, 0xf6), buffer[base]);
+                    try std.testing.expectEqualSlices(u8, &rgb, buffer[base + 5 ..][0..3]);
+                }
+            }
+        }
+    }
+    var report: [maximum_output_bytes]u8 = undefined;
+    _ = buildOutput(.dual_sense, .bluetooth, .{ .set_motors = false, .set_light_bar = false, .reset_light_bar = true }, &report);
+    try std.testing.expectEqual(@as(u8, 0), report[3]);
+    try std.testing.expectEqual(@as(u8, 8), report[4]);
+}
+
+test "Bluetooth light bar waits for the connection animation" {
+    var report = [_]u8{0} ** 78;
+    report[0] = 0x31;
+    std.mem.writeInt(u32, report[29..33], 10_199_999, .little);
+    try std.testing.expect(!bluetoothLightBarReady(&report));
+    std.mem.writeInt(u32, report[29..33], 10_200_000, .little);
+    try std.testing.expect(bluetoothLightBarReady(&report));
+    try std.testing.expect(!bluetoothLightBarReady(report[0..32]));
+    report[0] = 1;
+    try std.testing.expect(!bluetoothLightBarReady(&report));
+}
+
+test "the transport is recovered from the declared output report length" {
+    // The cable descriptors: one 32-byte (DualShock 4) or 48-byte (DualSense)
+    // output report, which is exactly what buildOutput sends over USB.
+    try std.testing.expectEqual(Transport.usb, transportFromOutputLength(32));
+    try std.testing.expectEqual(Transport.usb, transportFromOutputLength(48));
+    // Bluetooth descriptors declare the effects report and longer siblings;
+    // Windows reports the longest of them.
+    try std.testing.expectEqual(Transport.bluetooth, transportFromOutputLength(78));
+    try std.testing.expectEqual(Transport.bluetooth, transportFromOutputLength(548));
+    var buffer: [maximum_output_bytes]u8 = undefined;
+    for ([_]Family{ .dual_sense, .dual_shock_4 }) |family| {
+        const wired = buildOutput(family, .usb, .{}, &buffer).?;
+        try std.testing.expectEqual(Transport.usb, transportFromOutputLength(wired));
+        const wireless = buildOutput(family, .bluetooth, .{}, &buffer).?;
+        try std.testing.expectEqual(Transport.bluetooth, transportFromOutputLength(wireless));
+    }
+}
+
+test "a wired DualSense output report carries the motors and the light bar" {
+    var buffer: [maximum_output_bytes]u8 = undefined;
+    const length = buildOutput(
+        .dual_sense,
+        .usb,
+        .{ .rumble_strong = 0x80, .rumble_weak = 0x40, .red = 1, .green = 2, .blue = 3 },
+        &buffer,
+    ) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 48), length);
+    try std.testing.expectEqual(@as(u8, 0x02), buffer[0]);
+    // Without these enable bits the pad accepts the report and does nothing.
+    try std.testing.expectEqual(@as(u8, 0x03), buffer[1]);
+    try std.testing.expectEqual(@as(u8, 0x04), buffer[2]);
+    try std.testing.expectEqual(@as(u8, 0x40), buffer[3]);
+    try std.testing.expectEqual(@as(u8, 0x80), buffer[4]);
+    try std.testing.expectEqual(@as(u8, 1), buffer[45]);
+    try std.testing.expectEqual(@as(u8, 2), buffer[46]);
+    try std.testing.expectEqual(@as(u8, 3), buffer[47]);
+}
+
+test "a wireless report shifts its payload and ends in a checksum" {
+    var buffer: [maximum_output_bytes]u8 = undefined;
+    const length = buildOutput(
+        .dual_sense,
+        .bluetooth,
+        .{ .rumble_strong = 0x11, .red = 0xaa },
+        &buffer,
+    ) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 78), length);
+    try std.testing.expectEqual(@as(u8, 0x31), buffer[0]);
+    try std.testing.expectEqual(@as(u8, 0), buffer[1]);
+    try std.testing.expectEqual(@as(u8, 0x10), buffer[2]);
+    try std.testing.expectEqual(@as(u8, 0x03), buffer[3]);
+    try std.testing.expectEqual(@as(u8, 0x11), buffer[6]);
+    try std.testing.expectEqual(@as(u8, 0xaa), buffer[47]);
+
+    var expected = std.hash.Crc32.init();
+    expected.update(&[_]u8{bluetooth_checksum_seed});
+    expected.update(buffer[0..74]);
+    try std.testing.expectEqual(expected.final(), std.mem.readInt(u32, buffer[74..78], .little));
+}
+
+test "a DualShock 4 puts its light bar right after the motors" {
+    var buffer: [maximum_output_bytes]u8 = undefined;
+    const wired = buildOutput(
+        .dual_shock_4,
+        .usb,
+        .{ .rumble_strong = 0x33, .rumble_weak = 0x22, .red = 9, .green = 8, .blue = 7 },
+        &buffer,
+    ) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 32), wired);
+    try std.testing.expectEqual(@as(u8, 0x05), buffer[0]);
+    try std.testing.expectEqual(@as(u8, 0x22), buffer[4]);
+    try std.testing.expectEqual(@as(u8, 0x33), buffer[5]);
+    try std.testing.expectEqual(@as(u8, 9), buffer[6]);
+
+    const wireless = buildOutput(.dual_shock_4, .bluetooth, .{ .red = 9 }, &buffer) orelse
+        return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 78), wireless);
+    try std.testing.expectEqual(@as(u8, 0x11), buffer[0]);
+    try std.testing.expectEqual(@as(u8, 9), buffer[8]);
+}
+
+test "a buffer too small for the report is refused" {
+    var small: [16]u8 = undefined;
+    try std.testing.expect(buildOutput(.dual_sense, .usb, .{}, &small) == null);
+}
+
+test "motor updates preserve the light bar and Bluetooth sequence and checksum" {
+    for ([_]Family{ .dual_sense, .dual_shock_4 }) |family| {
+        for ([_]Transport{ .usb, .bluetooth }) |transport| {
+            var bytes: [maximum_output_bytes]u8 = undefined;
+            const length = buildOutput(family, transport, .{ .rumble_strong = 255, .rumble_weak = 127, .set_light_bar = false, .sequence = 13 }, &bytes).?;
+            const base: usize = if (transport == .usb) 1 else 3;
+            if (family == .dual_sense) {
+                try std.testing.expectEqual(@as(u8, 0), bytes[base + 1]);
+                try std.testing.expectEqual(@as(u8, 127), bytes[base + 2]);
+                try std.testing.expectEqual(@as(u8, 255), bytes[base + 3]);
+                if (transport == .bluetooth) try std.testing.expectEqual(@as(u8, 0xd0), bytes[1]);
+            } else {
+                try std.testing.expectEqual(@as(u8, 1), bytes[base]);
+                try std.testing.expectEqual(@as(u8, 127), bytes[base + 3]);
+                try std.testing.expectEqual(@as(u8, 255), bytes[base + 4]);
+            }
+            if (transport == .bluetooth) {
+                var checksum = std.hash.Crc32.init();
+                checksum.update(&.{0xa2});
+                checksum.update(bytes[0 .. length - 4]);
+                try std.testing.expectEqual(checksum.final(), std.mem.readInt(u32, bytes[length - 4 ..][0..4], .little));
+            }
+        }
+    }
+}
+
+test "only Sony's own products are claimed" {
+    try std.testing.expectEqual(Family.dual_sense, identify(sony_vendor, 0x0ce6).?);
+    try std.testing.expectEqual(Family.dual_sense, identify(sony_vendor, 0x0df2).?);
+    try std.testing.expectEqual(Family.dual_shock_4, identify(sony_vendor, 0x09cc).?);
+    try std.testing.expect(identify(sony_vendor, 0x0001) == null);
+    try std.testing.expect(identify(0x045e, 0x0ce6) == null);
+}
+
+test "a wired DualSense report reads its sticks, triggers and buttons" {
+    var report = [_]u8{0} ** dual_sense_extended_length;
+    report[0] = 0x01;
+    report[1] = 0x20; // left x
+    report[2] = 0xd0; // left y
+    report[3] = 0x90; // right x
+    report[4] = 0x40; // right y
+    report[5] = 0x7f; // L2
+    report[6] = 0xff; // R2
+    report[8] = 0x20 | 4; // cross, hat south
+    report[9] = 0x21; // L1 and options
+    report[10] = 0x02; // touch pad
+
+    const pad = parse(.dual_sense, &report) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u8, 0x20), pad.left_x);
+    try std.testing.expectEqual(@as(u8, 0xd0), pad.left_y);
+    try std.testing.expectEqual(@as(u8, 0x90), pad.right_x);
+    try std.testing.expectEqual(@as(u8, 0x40), pad.right_y);
+    try std.testing.expectEqual(@as(u8, 0x7f), pad.analog_l2);
+    try std.testing.expectEqual(@as(u8, 0xff), pad.analog_r2);
+    try std.testing.expect(pad.cross and pad.l1 and pad.options and pad.touch_pad);
+    try std.testing.expect(pad.down and !pad.up and !pad.left and !pad.right);
+    try std.testing.expect(!pad.circle and !pad.square and !pad.triangle);
+}
+
+test "the Bluetooth DualSense report carries the same fields one byte later" {
+    var wired = [_]u8{0} ** dual_sense_extended_length;
+    wired[0] = 0x01;
+    wired[1] = 0x11;
+    wired[2] = 0x22;
+    wired[3] = 0x33;
+    wired[4] = 0x44;
+    wired[5] = 0x55;
+    wired[6] = 0x66;
+    wired[8] = 0x80 | 2; // triangle, hat east
+    wired[9] = 0x82; // R1 and R3
+
+    var wireless = [_]u8{0} ** 78;
+    wireless[0] = 0x31;
+    @memcpy(wireless[2..12], wired[1..11]);
+
+    const from_cable = parse(.dual_sense, &wired) orelse return error.TestFailed;
+    const from_radio = parse(.dual_sense, &wireless) orelse return error.TestFailed;
+    try std.testing.expectEqualDeep(from_cable, from_radio);
+    try std.testing.expect(from_radio.triangle and from_radio.right and from_radio.r1 and from_radio.r3);
+}
+
+test "a DualShock 4 puts its triggers after the button bytes" {
+    var wired = [_]u8{0} ** 64;
+    wired[0] = 0x01;
+    wired[1] = 0x10; // left x
+    wired[2] = 0x20; // left y
+    wired[3] = 0x30; // right x
+    wired[4] = 0x40; // right y
+    wired[5] = 0x40 | 6; // circle, hat west
+    wired[6] = 0x08; // R2 pressed
+    wired[7] = 0x01; // home
+    wired[8] = 0x11; // L2 analogue
+    wired[9] = 0xf0; // R2 analogue
+
+    const pad = parse(.dual_shock_4, &wired) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(u8, 0x10), pad.left_x);
+    try std.testing.expectEqual(@as(u8, 0x11), pad.analog_l2);
+    try std.testing.expectEqual(@as(u8, 0xf0), pad.analog_r2);
+    try std.testing.expect(pad.circle and pad.left and pad.r2 and pad.home);
+
+    // Over Bluetooth the same payload begins two bytes further in.
+    var wireless = [_]u8{0} ** 78;
+    wireless[0] = 0x11;
+    @memcpy(wireless[3..13], wired[1..11]);
+    const wireless_pad = parse(.dual_shock_4, &wireless) orelse return error.TestFailed;
+    try std.testing.expectEqualDeep(pad, wireless_pad);
+}
+
+test "the compact DualSense report is told apart by its length" {
+    // Bluetooth before the host asks for the full report: report id one, but
+    // the shorter DualShock 4 ordering.
+    var compact = [_]u8{0} ** 10;
+    compact[0] = 0x01;
+    compact[1] = 0x7f;
+    compact[5] = 0x20 | 8; // cross, hat neutral
+    compact[8] = 0x33; // L2 analogue in the compact position
+
+    const pad = parse(.dual_sense, &compact) orelse return error.TestFailed;
+    try std.testing.expect(pad.cross);
+    try std.testing.expectEqual(@as(u8, 0x33), pad.analog_l2);
+    try std.testing.expect(!pad.up and !pad.down and !pad.left and !pad.right);
+}
+
+test "full reports carry the gyroscope, accelerometer and sensor clock" {
+    const gyro = [3]i16{ 120, -340, 5 };
+    const accel = [3]i16{ -15, 8190, 260 };
+    const fill = struct {
+        fn sensors(report: []u8, offset: usize, g: [3]i16, a: [3]i16) void {
+            for (0..3) |axis| {
+                std.mem.writeInt(i16, report[offset + axis * 2 ..][0..2], g[axis], .little);
+                std.mem.writeInt(i16, report[offset + 6 + axis * 2 ..][0..2], a[axis], .little);
+            }
+        }
+    };
+
+    var wired = [_]u8{0} ** dual_sense_extended_length;
+    wired[0] = 0x01;
+    fill.sensors(&wired, 16, gyro, accel);
+    std.mem.writeInt(u32, wired[28..32], 0x1234_5678, .little);
+    var wireless = [_]u8{0} ** 78;
+    wireless[0] = 0x31;
+    @memcpy(wireless[2..34], wired[1..33]);
+    for ([_][]const u8{ &wired, &wireless }) |report| {
+        const motion = (parse(.dual_sense, report) orelse return error.TestFailed).motion orelse return error.TestFailed;
+        try std.testing.expectEqual(gyro, motion.gyro);
+        try std.testing.expectEqual(accel, motion.accel);
+        try std.testing.expectEqual(@as(u32, 0x1234_5678), motion.timestamp);
+    }
+
+    var ds4 = [_]u8{0} ** 64;
+    ds4[0] = 0x01;
+    std.mem.writeInt(u16, ds4[10..12], 0xbeef, .little);
+    fill.sensors(&ds4, 13, gyro, accel);
+    var ds4_wireless = [_]u8{0} ** 78;
+    ds4_wireless[0] = 0x11;
+    @memcpy(ds4_wireless[3..27], ds4[1..25]);
+    for ([_][]const u8{ &ds4, &ds4_wireless }) |report| {
+        const motion = (parse(.dual_shock_4, report) orelse return error.TestFailed).motion orelse return error.TestFailed;
+        try std.testing.expectEqual(gyro, motion.gyro);
+        try std.testing.expectEqual(accel, motion.accel);
+        try std.testing.expectEqual(@as(u32, 0xbeef), motion.timestamp);
+    }
+
+    // The short Bluetooth forms have no sensors yet.
+    var compact = [_]u8{0} ** 10;
+    compact[0] = 0x01;
+    try std.testing.expect(parse(.dual_sense, &compact).?.motion == null);
+    try std.testing.expect(parse(.dual_shock_4, &compact).?.motion == null);
+}
+
+test "reports that are unknown or too short are refused" {
+    try std.testing.expect(parse(.dual_sense, &.{}) == null);
+    try std.testing.expect(parse(.dual_sense, &.{0x05}) == null);
+    // A truncated report never yields a half-decoded pad.
+    try std.testing.expect(parse(.dual_shock_4, &[_]u8{ 0x01, 0, 0 }) == null);
+}

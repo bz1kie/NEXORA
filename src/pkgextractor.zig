@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Extracts PS5 debug packages (FPKG / `\x7FFIH`) and ZArchive game dumps.
+//!
+//! Usage:
+//!   pkgextractor <game.pkg|game.zar> [-o <output-dir>]
+//!
+//! Unencrypted CNT entries (param.json, icons, PlayGo tables, trophies) are
+//! written under `sce_sys/`. Debug / passcode packages also unpack
+//! uncompressed SELF modules from the nested `pfs_image.dat` (`eboot.bin`
+//! and `sce_module/*.prx`) plus the inner uroot file payloads. Retail
+//! packages are refused.
+
+const std = @import("std");
+const pkg = @import("pkg");
+const zarchive = @import("zarchive");
+
+const usage =
+    \\pkgextractor <game.pkg|game.zar> [-o <output-dir>]
+    \\
+    \\Reads a PS5 debug package (FIH FPKG) and writes unencrypted metadata
+    \\into output-dir/sce_sys plus inner application files (eboot.bin,
+    \\sce_module/*.prx, keystone, and uroot payloads) from the nested PFS.
+    \\Retail packages cannot be extracted.
+    \\ZAR archives are streamed into a new output directory (no overwrite).
+    \\
+;
+
+fn extractZar(io: std.Io, input: []const u8, output: []const u8) !void {
+    const reader = zarchive.Reader.open(io, .cwd(), input, std.heap.page_allocator) catch |err| {
+        std.debug.print("cannot open ZAR {s}: {s}\n", .{ input, @errorName(err) });
+        return err;
+    };
+    defer reader.close();
+    var context: u8 = 0;
+    const result = reader.extract(.cwd(), output, .{ .context = &context, .update = zarProgress }) catch |err| {
+        if (err == error.PathAlreadyExists) {
+            std.debug.print("ZAR output already exists: {s}\nChoose a new output directory with -o; existing files are not overwritten.\n", .{output});
+        } else {
+            std.debug.print("ZAR extraction failed ({s}); output at {s} may be incomplete\n", .{ @errorName(err), output });
+        }
+        return err;
+    };
+    std.debug.print("extracted {d} file(s), {d} bytes to {s}\n", .{ result.files, result.bytes, output });
+}
+
+fn zarProgress(_: *anyopaque, path: []const u8, done: u64, total: u64) void {
+    if (path.len != 0) std.debug.print("  {s}\n", .{path});
+    std.debug.print("progress {d} {d}\n", .{ done, total });
+}
+
+const WriteCtx = struct {
+    dest: std.Io.Dir,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+
+    fn visit(self: *WriteCtx, relative: []const u8, bytes: []const u8) anyerror!void {
+        const path = try std.fmt.allocPrint(self.allocator, "sce_sys/{s}", .{relative});
+        defer self.allocator.free(path);
+        if (std.fs.path.dirname(path)) |parent| {
+            self.dest.createDirPath(self.io, parent) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
+        try self.dest.writeFile(self.io, .{ .sub_path = path, .data = bytes });
+        std.debug.print("  {s}  {d} bytes\n", .{ path, bytes.len });
+    }
+};
+
+/// The CNT region of the package file, read where each entry lies.
+const FileSource = struct {
+    file: std.Io.File,
+    io: std.Io,
+    offset: u64,
+    size: u64,
+
+    pub fn len(self: FileSource) u64 {
+        return self.size;
+    }
+
+    pub fn read(self: FileSource, offset: u64, buffer: []u8) !void {
+        if (offset > self.size or buffer.len > self.size - offset) return error.TruncatedPackage;
+        const got = try self.file.readPositionalAll(self.io, buffer, self.offset + offset);
+        if (got != buffer.len) return error.TruncatedPackage;
+    }
+};
+
+fn defaultOutputPath(allocator: std.mem.Allocator, pkg_path: []const u8) ![]u8 {
+    const stem = std.fs.path.stem(pkg_path);
+    const dir = std.fs.path.dirname(pkg_path) orelse ".";
+    return std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ dir, std.fs.path.sep, stem });
+}
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const arena = init.arena.allocator();
+
+    var stderr_buffer: [1024]u8 = undefined;
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);
+    const stderr = &stderr_writer.interface;
+
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len < 2) {
+        try stderr.writeAll(usage);
+        try stderr.flush();
+        return error.InvalidUsage;
+    }
+
+    var pkg_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    var index: usize = 1;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            index += 1;
+            if (index >= args.len) {
+                try stderr.writeAll("missing value for -o\n");
+                try stderr.flush();
+                return error.InvalidUsage;
+            }
+            out_path = args[index];
+        } else if (pkg_path == null) {
+            pkg_path = arg;
+        } else {
+            try stderr.writeAll(usage);
+            try stderr.flush();
+            return error.InvalidUsage;
+        }
+    }
+    const input = pkg_path orelse {
+        try stderr.writeAll(usage);
+        try stderr.flush();
+        return error.InvalidUsage;
+    };
+    const dest_path = out_path orelse try defaultOutputPath(arena, input);
+    if (std.ascii.eqlIgnoreCase(std.fs.path.extension(input), ".zar")) {
+        return extractZar(io, input, dest_path);
+    }
+
+    var file = std.Io.Dir.cwd().openFile(io, input, .{ .mode = .read_only }) catch |err| {
+        try stderr.print("cannot open {s}: {s}\n", .{ input, @errorName(err) });
+        try stderr.flush();
+        return err;
+    };
+    defer file.close(io);
+
+    const file_size = file.length(io) catch |err| {
+        try stderr.print("cannot stat {s}: {s}\n", .{ input, @errorName(err) });
+        try stderr.flush();
+        return err;
+    };
+
+    var header: [0x100]u8 = undefined;
+    _ = file.readPositionalAll(io, &header, 0) catch |err| {
+        try stderr.print("cannot read {s}: {s}\n", .{ input, @errorName(err) });
+        try stderr.flush();
+        return err;
+    };
+
+    const kind = pkg.detectKind(&header) orelse {
+        try stderr.writeAll("not a PS5 package (expected FIH or CNT magic)\n");
+        try stderr.flush();
+        return error.NotAPackage;
+    };
+    if (kind == .fih_retail) {
+        try stderr.writeAll("retail packages cannot be extracted without console image keys\n");
+        try stderr.flush();
+        std.process.exit(2);
+    }
+
+    var cnt_offset: u64 = 0;
+    var cnt_size: u64 = file_size;
+    // The CNT runs to the end of the file; its entries are read one at a
+    // time, so no part of it needs to fit in memory at once.
+    var pfs_offset: u64 = 0;
+    var pfs_size: u64 = 0;
+    var superblock_abs: u64 = 0;
+    if (kind != .cnt) {
+        const fih = pkg.parseFih(&header, file_size) catch |err| {
+            try stderr.print("invalid FIH header: {s}\n", .{@errorName(err)});
+            try stderr.flush();
+            return err;
+        };
+        cnt_offset = fih.cnt_offset;
+        cnt_size = file_size - fih.cnt_offset;
+        pfs_offset = fih.pfs_offset;
+        pfs_size = fih.pfs_size;
+        superblock_abs = fih.superblock_offset;
+        std.debug.print(
+            "FIH debug  format={d}  pfs=0x{x}+0x{x}  sb=0x{x}  cnt=0x{x}\n",
+            .{ fih.format_version, pfs_offset, pfs_size, superblock_abs, cnt_offset },
+        );
+    }
+
+    const source = FileSource{ .file = file, .io = io, .offset = cnt_offset, .size = cnt_size };
+
+    std.Io.Dir.cwd().createDirPath(io, dest_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            try stderr.print("cannot create {s}: {s}\n", .{ dest_path, @errorName(err) });
+            try stderr.flush();
+            return err;
+        },
+    };
+    var dest = std.Io.Dir.cwd().openDir(io, dest_path, .{}) catch |err| {
+        try stderr.print("cannot open {s}: {s}\n", .{ dest_path, @errorName(err) });
+        try stderr.flush();
+        return err;
+    };
+    defer dest.close(io);
+
+    var ctx = WriteCtx{ .dest = dest, .io = io, .allocator = arena };
+    const result = pkg.visitExtractable(std.heap.page_allocator, source, &ctx, WriteCtx.visit) catch |err| {
+        try stderr.print("extract failed: {s}\n", .{@errorName(err)});
+        try stderr.flush();
+        return err;
+    };
+
+    std.debug.print(
+        "content-id {s}\nextracted {d} file(s) to {s}\nskipped {d} encrypted CNT entries\n",
+        .{
+            std.mem.sliceTo(&result.content_id, 0),
+            result.written,
+            dest_path,
+            result.skipped_encrypted,
+        },
+    );
+    if (pfs_size != 0) {
+        const app = pkg.pfs.extractAppFiles(file, io, std.heap.page_allocator, pfs_offset, pfs_size, superblock_abs, dest) catch |err| {
+            std.debug.print(
+                "inner PFS unpack failed ({s}); output is incomplete\n",
+                .{@errorName(err)},
+            );
+            return err;
+        };
+        if (app.eboot) {
+            std.debug.print("unpacked eboot.bin, {d} module(s), {d} inner file(s)\n", .{ app.modules, app.files });
+        } else {
+            std.debug.print(
+                "inner PFS had no SCE_DYNEXEC eboot.bin ({d} other SELF module(s), {d} inner file(s))\n",
+                .{ app.modules, app.files },
+            );
+        }
+    }
+}
