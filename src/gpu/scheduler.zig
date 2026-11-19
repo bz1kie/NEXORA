@@ -1517,7 +1517,7 @@ test "mirroring a snapshot alone does not publish a live synchronization label" 
 test "pump report counts idle and blocked passes without fabricating progress" {
     const testing = std.testing;
     var host = FakeBackend{};
-    var scheduler = Scheduler.init(testing.allocator, host.backend());
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
     defer scheduler.deinit();
     const idle = try scheduler.pump();
     try testing.expectEqual(@as(usize, 1), idle.pump_iterations);
