@@ -15,10 +15,7 @@ pub const FrameSampler = struct {
             self.last_ns = timestamp_ns;
             return;
         };
-        if (timestamp_ns <= previous) {
-            self.last_ns = timestamp_ns;
-            return;
-        }
+        if (timestamp_ns <= previous) return;
         self.last_ns = timestamp_ns;
         self.intervals_ns[self.next] = timestamp_ns - previous;
         self.next = (self.next + 1) % capacity;
@@ -55,6 +52,15 @@ test "non-monotonic timestamps are not recorded" {
     sampler.note(90);
     sampler.note(110);
     try std.testing.expectEqual(@as(u64, 20), sampler.interval(0).?);
+}
+
+test "backward timestamps do not distort the next valid interval" {
+    var sampler: FrameSampler = .{};
+    sampler.note(1_000_000);
+    sampler.note(900_000);
+    sampler.note(17_000_000);
+    try std.testing.expectEqual(@as(usize, 1), sampler.count);
+    try std.testing.expectEqual(@as(u64, 16_000_000), sampler.interval(0).?);
 }
 
 test "ring buffer retains the newest samples in chronological order" {
