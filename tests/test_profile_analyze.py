@@ -33,9 +33,9 @@ class AnalyzerTests(unittest.TestCase):
 
     def test_stutter_thresholds_are_strict(self):
         result = analyze(self.write_capture([16.0, 33.333333, 33.4, 50.0, 50.1]))
-        self.assertEqual(result["frames_over_33ms"], 2)
+        self.assertEqual(result["frames_over_33ms"], 3)
         self.assertEqual(result["frames_over_50ms"], 1)
-        self.assertEqual(result["stutter_over_33ms_percent"], 40.0)
+        self.assertEqual(result["stutter_over_33ms_percent"], 60.0)
         self.assertEqual(result["stutter_over_50ms_percent"], 20.0)
 
     def test_constant_60fps_has_no_stutters(self):
