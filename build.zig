@@ -708,7 +708,7 @@ pub fn build(b: *std.Build) void {
     );
     if (target.result.os.tag == .windows) {
         const native_launcher = b.addExecutable(.{
-            .name = "ps5pcem",
+            .name = "NEXORA",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/launcher.zig"),
                 .target = target,
@@ -748,7 +748,7 @@ pub fn build(b: *std.Build) void {
         // Pango, which it opens at run time as game-run opens X11 and
         // PulseAudio, so the build needs no GTK development files.
         const linux_launcher = b.addExecutable(.{
-            .name = "ps5pcem",
+            .name = "NEXORA",
             .root_module = b.createModule(.{
                 .root_source_file = b.path("src/launcher_linux.zig"),
                 .target = target,
