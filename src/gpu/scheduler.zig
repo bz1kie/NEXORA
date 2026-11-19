@@ -61,6 +61,10 @@ pub const Error = executor.Error;
 pub const QueueKind = enum { graphics, compute };
 
 pub const PumpReport = struct {
+    /// Number of scheduler passes; not a measure of elapsed time or GPU stalls.
+    pump_iterations: usize = 0,
+    /// Passes that ended with no completed submission.
+    no_progress_iterations: usize = 0,
     completed_submissions: usize = 0,
     blocked_checks: usize = 0,
     packets: usize = 0,
@@ -507,6 +511,7 @@ pub const Scheduler = struct {
     pub fn pump(self: *Scheduler) Error!PumpReport {
         var report = PumpReport{};
         while (true) {
+            report.pump_iterations += 1;
             var made_progress = false;
             const steps: [2]Step = if (self.parallel_commands)
                 try self.stepQueuesParallel()
@@ -523,7 +528,10 @@ pub const Scheduler = struct {
                     },
                 }
             }
-            if (!made_progress) return report;
+            if (!made_progress) {
+                report.no_progress_iterations += 1;
+                return report;
+            }
         }
     }
 
