@@ -2,11 +2,11 @@
 
 Experimental PlayStation 5 emulator project based on [PS5PCEM](https://github.com/iStark/PS5PCEM).
 
-> **Status:** project bootstrap only. The upstream emulator source has **not yet been imported**, so this repository is not currently a working PS5 emulator.
+> **Status:** experimental development. The upstream PS5PCEM source and Git history were imported into the `import/ps5pcem-upstream-44485557126` branch. A verified NEXORA emulator build is still pending.
 
 ## Development approach
 
-1. Import the upstream PS5PCEM Git history and source code, preserving its notices and GPL-3.0-or-later license.
+1. Preserve the imported upstream PS5PCEM Git history, source code, copyright notices, and GPL-3.0-or-later license.
 2. Keep the original emulator architecture operational and establish repeatable baseline benchmarks.
 3. Add CPU/GPU frame profiling and regression tests.
 4. Incrementally optimize shader translation, Vulkan rendering, memory management, and HLE behavior.
