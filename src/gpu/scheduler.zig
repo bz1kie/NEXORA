@@ -71,6 +71,16 @@ pub const PumpReport = struct {
     draws: usize = 0,
     dispatches: usize = 0,
 
+    pub fn add(self: *PumpReport, other: PumpReport) void {
+        self.pump_iterations += other.pump_iterations;
+        self.no_progress_iterations += other.no_progress_iterations;
+        self.completed_submissions += other.completed_submissions;
+        self.blocked_checks += other.blocked_checks;
+        self.packets += other.packets;
+        self.draws += other.draws;
+        self.dispatches += other.dispatches;
+    }
+
     fn record(self: *PumpReport, result: executor.Result) void {
         self.packets += result.packets;
         self.draws += result.draws;
@@ -331,6 +341,8 @@ pub const Scheduler = struct {
     compute: Queue = .{},
     parallel_commands: bool = false,
     command_pool: command_workers.Pool = .{},
+    /// Cumulative counters from completed pump calls; no wall-clock timings.
+    pump_totals: PumpReport = .{},
     snapshot_lock: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator, backend: executor.Backend) Scheduler {
@@ -508,6 +520,11 @@ pub const Scheduler = struct {
     /// Rechecks blocked heads and drains newly runnable FIFO work. Callers use
     /// this after a synchronous `RELEASE_MEM`, or after an asynchronous backend
     /// reports that its release-label write has actually completed.
+    /// Read cumulative scheduler work counters for diagnostics.
+    pub fn pumpTotals(self: *const Scheduler) PumpReport {
+        return self.pump_totals;
+    }
+
     pub fn pump(self: *Scheduler) Error!PumpReport {
         var report = PumpReport{};
         while (true) {
@@ -530,6 +547,7 @@ pub const Scheduler = struct {
             }
             if (!made_progress) {
                 report.no_progress_iterations += 1;
+                self.pump_totals.add(report);
                 return report;
             }
         }
