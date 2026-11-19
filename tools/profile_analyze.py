@@ -48,6 +48,10 @@ def analyze(path):
         "p95_frame_ms": round(percentile(frames, 95), 3),
         "p99_frame_ms": round(percentile(frames, 99), 3),
         "one_percent_low_fps": round(1000 / statistics.mean(slowest_one_percent), 3),
+        "frames_over_33ms": sum(ms > 33.333333 for ms in frames),
+        "frames_over_50ms": sum(ms > 50.0 for ms in frames),
+        "stutter_over_33ms_percent": round(100 * sum(ms > 33.333333 for ms in frames) / len(frames), 3),
+        "stutter_over_50ms_percent": round(100 * sum(ms > 50.0 for ms in frames) / len(frames), 3),
     }
 
 
