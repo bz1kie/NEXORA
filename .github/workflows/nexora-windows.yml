@@ -30,6 +30,19 @@ jobs:
         run: |
           if (!(Test-Path 'zig-out/bin/NEXORA.exe')) { throw 'NEXORA.exe was not produced' }
           if (!(Test-Path 'zig-out/bin/game-run.exe')) { throw 'game-run.exe companion was not produced' }
+      - name: Package portable NEXORA ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path 'zig-out/bin/*' -DestinationPath 'dist/NEXORA-windows-x64-portable.zip' -Force
+          if (!(Test-Path 'dist/NEXORA-windows-x64-portable.zip')) { throw 'Portable ZIP missing' }
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: NEXORA-windows-x64-portable
+          path: dist/NEXORA-windows-x64-portable.zip
+          if-no-files-found: error
+          retention-days: 14
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
         with:
