@@ -20,6 +20,14 @@ class WaitAuditTests(unittest.TestCase):
             self.assertEqual([x["line"] for x in result["candidates"]], [2, 3])
             self.assertEqual(result["candidates"][0]["category"], "vulkan_fence_wait")
 
+    def test_zig_condition_wait(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "queue.zig").write_text("condition.wait(&mutex);\\n", encoding="utf-8")
+            result = audit(root)
+            self.assertEqual(result["candidate_count"], 1)
+            self.assertEqual(result["candidates"][0]["category"], "zig_condition_wait")
+
     def test_empty_tree(self):
         with tempfile.TemporaryDirectory() as temp:
             self.assertEqual(audit(Path(temp))["candidate_count"], 0)
