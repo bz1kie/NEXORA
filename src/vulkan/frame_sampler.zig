@@ -87,7 +87,7 @@ test "non-monotonic timestamps are not recorded" {
     sampler.note(100);
     sampler.note(90);
     sampler.note(110);
-    try std.testing.expectEqual(@as(u64, 20), sampler.interval(0).?);
+    try std.testing.expectEqual(@as(u64, 10), sampler.interval(0).?);
 }
 
 test "backward timestamps do not distort the next valid interval" {
