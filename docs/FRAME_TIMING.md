@@ -11,8 +11,8 @@ not counted as a frame interval. Non-increasing timestamps are ignored.
 
 The independent `tools/profile_analyze.py` accepts CSV with a `frame_ms`
 column. The Zig sampler provides `writeCsv(writer)` for this format, but
-**the emulator does not yet expose a user-facing export command or write a
-CSV file automatically**.
+**the renderer now exposes `writeNexoraFrameCsv(writer)`, but the emulator does
+not yet expose a user-facing export command or write a CSV file automatically**.
 
 ## Interpretation
 
