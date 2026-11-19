@@ -20,3 +20,5 @@ jobs:
           version: '0.16.0'
       - name: Build emulator (ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
+      - name: Test Vulkan frame sampler
+        run: zig test src/vulkan/frame_sampler.zig
