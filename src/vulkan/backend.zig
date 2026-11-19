@@ -6964,6 +6964,7 @@ pub const Renderer = struct {
     presentation_sink: ?PresentationSink = null,
     frame_rate_sink: ?FrameRateSink = null,
     frame_rate_counter: FrameRateCounter = .{},
+    nexora_frame_sampler: @import("frame_sampler.zig").FrameSampler = .{},
     display_buffer_resolver: ?DisplayBufferResolver = null,
     pending_targetless_draws: std.ArrayList(PendingGuestDraw) = .empty,
     window_presentation: ?WindowPresentation = null,
@@ -40223,6 +40224,7 @@ pub const Renderer = struct {
         self.flushComputeCensus();
         const profile = self.frame_profile;
         const now = hostTimestampNs();
+        if (now != 0) self.nexora_frame_sampler.note(now);
         if (self.frame_rate_sink) |sink| {
             if (self.frame_rate_counter.note(now)) |fps_tenths| {
                 sink.update(sink.context, fps_tenths);
