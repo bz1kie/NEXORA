@@ -14,6 +14,7 @@ PATTERNS = {
     "vulkan_idle_wait": re.compile(r"\b(?:vkDeviceWaitIdle|vkQueueWaitIdle|deviceWaitIdle|queueWaitIdle|wait_idle)\b", re.I),
     "host_condition_wait": re.compile(r"\b(?:Condition|condition_variable|waitForSingleObject|WaitForSingleObject)\b"),
     "host_thread_join": re.compile(r"\b(?:pthread_join|WaitForMultipleObjects)\b"),
+    "zig_condition_wait": re.compile(r"\.\s*(?:timedWait|wait)\s*\("),
 }
 EXTENSIONS = {".zig", ".c", ".cc", ".cpp", ".h", ".hpp"}
 MAX_MATCHES = 10000
