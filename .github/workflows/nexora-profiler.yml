@@ -1,0 +1,35 @@
+name: NEXORA frame profiler
+
+on:
+  push:
+    branches: [feature/nexora-build-baseline]
+    paths:
+      - 'tools/profile_analyze.py'
+      - 'tests/test_profile_analyze.py'
+      - 'samples/frames.csv'
+      - '.github/workflows/nexora-profiler.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profiler:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p 'test_profile_analyze.py' -v
+      - name: Sample frame report
+        run: python tools/profile_analyze.py samples/frames.csv --out frame-report.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frame-report-${{ matrix.os }}
+          path: frame-report.json
