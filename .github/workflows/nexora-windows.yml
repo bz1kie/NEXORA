@@ -24,6 +24,11 @@ jobs:
           version: '0.16.0'
       - name: Build NEXORA (Windows x64, ReleaseSafe)
         run: zig build -Doptimize=ReleaseSafe
+      - name: Verify graphical NEXORA executable
+        shell: pwsh
+        run: |
+          if (!(Test-Path 'zig-out/bin/NEXORA.exe')) { throw 'NEXORA.exe was not produced' }
+          if (!(Test-Path 'zig-out/bin/game-run.exe')) { throw 'game-run.exe companion was not produced' }
       - name: Upload Windows binaries
         uses: actions/upload-artifact@v4
         with:
