@@ -35,6 +35,8 @@ pub const FrameSampler = struct {
         max_ns: u64,
         p95_ns: u64,
         p99_ns: u64,
+        frames_over_33ms: usize,
+        frames_over_50ms: usize,
     };
 
     /// Computes robust frame pacing metrics without allocations.
@@ -44,12 +46,16 @@ pub const FrameSampler = struct {
         var total: u128 = 0;
         var minimum: u64 = std.math.maxInt(u64);
         var maximum: u64 = 0;
+        var over_33ms: usize = 0;
+        var over_50ms: usize = 0;
         for (0..self.count) |i| {
             const value = self.interval(i).?;
             sorted[i] = value;
             total += value;
             minimum = @min(minimum, value);
             maximum = @max(maximum, value);
+            if (value > 33_333_333) over_33ms += 1;
+            if (value > 50_000_000) over_50ms += 1;
         }
         std.mem.sort(u64, sorted[0..self.count], {}, std.sort.asc(u64));
         const p95_index = (self.count * 95 + 99) / 100 - 1;
@@ -61,6 +67,8 @@ pub const FrameSampler = struct {
             .max_ns = maximum,
             .p95_ns = sorted[p95_index],
             .p99_ns = sorted[p99_index],
+            .frames_over_33ms = over_33ms,
+            .frames_over_50ms = over_50ms,
         };
     }
 
@@ -127,4 +135,16 @@ test "summary calculates average and percentile frame time" {
 test "empty sampler has no summary" {
     const sampler: FrameSampler = .{};
     try std.testing.expect(sampler.summarize() == null);
+}
+
+test "frame pacing counts slow frames at strict thresholds" {
+    var sampler: FrameSampler = .{};
+    sampler.note(1);
+    sampler.note(16_000_001);
+    sampler.note(49_333_334);
+    sampler.note(99_333_334);
+    sampler.note(159_333_335);
+    const summary = sampler.summarize().?;
+    try std.testing.expectEqual(@as(usize, 2), summary.frames_over_33ms);
+    try std.testing.expectEqual(@as(usize, 1), summary.frames_over_50ms);
 }
