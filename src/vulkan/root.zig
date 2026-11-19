@@ -10,6 +10,7 @@ pub const detile_spirv = @import("detile_spirv.zig");
 pub const image_alias = @import("image_alias.zig");
 pub const image_state = @import("image_state.zig");
 pub const pipeline_compiler = @import("pipeline_compiler.zig");
+pub const frame_sampler = @import("frame_sampler.zig");
 
 pub const Error = backend.Error;
 pub const Options = backend.Options;
@@ -37,6 +38,7 @@ test {
     _ = image_alias;
     _ = image_state;
     _ = pipeline_compiler;
+    _ = frame_sampler;
     _ = @import("pipeline_warmup.zig");
     _ = @import("guest_fingerprints.zig");
     _ = @import("buffer_write_history.zig");
