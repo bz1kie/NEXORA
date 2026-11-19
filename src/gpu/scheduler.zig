@@ -1512,3 +1512,15 @@ test "mirroring a snapshot alone does not publish a live synchronization label" 
         try testing.expectEqualSlices(u8, &.{0x20}, host.events[0..host.event_count]);
     }
 }
+
+
+test "pump report counts idle and blocked passes without fabricating progress" {
+    const testing = std.testing;
+    var host = FakeBackend{};
+    var scheduler = Scheduler.init(testing.allocator, host.backend());
+    defer scheduler.deinit();
+    const idle = try scheduler.pump();
+    try testing.expectEqual(@as(usize, 1), idle.pump_iterations);
+    try testing.expectEqual(@as(usize, 1), idle.no_progress_iterations);
+    try testing.expectEqual(@as(usize, 0), idle.completed_submissions);
+}
