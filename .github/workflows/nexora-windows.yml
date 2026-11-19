@@ -8,6 +8,7 @@ on:
       - 'src/**'
       - 'build.zig'
       - 'build.zig.zon'
+      - 'assets/windows/**'
   workflow_dispatch:
 
 permissions:
