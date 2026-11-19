@@ -1523,3 +1523,15 @@ test "pump report counts idle and blocked passes without fabricating progress" {
     try testing.expectEqual(@as(usize, 1), idle.no_progress_iterations);
     try testing.expectEqual(@as(usize, 0), idle.completed_submissions);
 }
+
+test "pump report counts completed submission and final no-progress pass" {
+    var host = FakeBackend{};
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+    const stream = [_]u32{ command(pm4.event_write, 1), 0x21 };
+    const report = try scheduler.submit(.graphics, &stream);
+    try testing.expectEqual(@as(usize, 1), report.completed_submissions);
+    try testing.expectEqual(@as(usize, 2), report.pump_iterations);
+    try testing.expectEqual(@as(usize, 1), report.no_progress_iterations);
+    try testing.expectEqual(@as(usize, 1), host.event_count);
+}
