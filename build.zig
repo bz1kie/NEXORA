@@ -736,7 +736,7 @@ pub fn build(b: *std.Build) void {
         // Run the installed copy: it resolves game-run.exe beside itself. The
         // old addRunArtifact path executed from Zig's cache and depended on the
         // entire install graph, rebuilding unrelated inspection tools.
-        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "ps5pcem.exe")});
+        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "NEXORA.exe")});
         launcher_cmd.step.dependOn(&install_native_launcher.step);
         launcher_cmd.step.dependOn(&install_game_run.step);
         const launcher_step = b.step("launcher", "Open the PS5PCEM launcher");
@@ -770,7 +770,7 @@ pub fn build(b: *std.Build) void {
         const build_launcher_step = b.step("build-launcher", "Build only the native PS5PCEM launcher");
         build_launcher_step.dependOn(&install_linux_launcher.step);
 
-        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "ps5pcem")});
+        const launcher_cmd = b.addSystemCommand(&.{b.getInstallPath(.bin, "NEXORA")});
         launcher_cmd.step.dependOn(&install_linux_launcher.step);
         launcher_cmd.step.dependOn(&install_game_run.step);
         const launcher_step = b.step("launcher", "Open the PS5PCEM launcher");
