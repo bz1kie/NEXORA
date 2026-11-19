@@ -28,6 +28,42 @@ pub const FrameSampler = struct {
         return self.intervals_ns[(start + index) % capacity];
     }
 
+    pub const Summary = struct {
+        samples: usize,
+        average_ns: u64,
+        min_ns: u64,
+        max_ns: u64,
+        p95_ns: u64,
+        p99_ns: u64,
+    };
+
+    /// Computes robust frame pacing metrics without allocations.
+    pub fn summarize(self: *const FrameSampler) ?Summary {
+        if (self.count == 0) return null;
+        var sorted: [capacity]u64 = undefined;
+        var total: u128 = 0;
+        var minimum: u64 = std.math.maxInt(u64);
+        var maximum: u64 = 0;
+        for (0..self.count) |i| {
+            const value = self.interval(i).?;
+            sorted[i] = value;
+            total += value;
+            minimum = @min(minimum, value);
+            maximum = @max(maximum, value);
+        }
+        std.mem.sort(u64, sorted[0..self.count], {}, std.sort.asc(u64));
+        const p95_index = (self.count * 95 + 99) / 100 - 1;
+        const p99_index = (self.count * 99 + 99) / 100 - 1;
+        return .{
+            .samples = self.count,
+            .average_ns = @intCast(total / self.count),
+            .min_ns = minimum,
+            .max_ns = maximum,
+            .p95_ns = sorted[p95_index],
+            .p99_ns = sorted[p99_index],
+        };
+    }
+
     /// Writes a CSV compatible with tools/profile_analyze.py.
     pub fn writeCsv(self: *const FrameSampler, writer: anytype) !void {
         try writer.writeAll("frame_ms\n");
@@ -70,4 +106,25 @@ test "ring buffer retains the newest samples in chronological order" {
     try std.testing.expectEqual(@as(usize, FrameSampler.capacity), sampler.count);
     try std.testing.expectEqual(@as(u64, 1), sampler.interval(0).?);
     try std.testing.expectEqual(@as(u64, 1), sampler.interval(FrameSampler.capacity - 1).?);
+}
+
+test "summary calculates average and percentile frame time" {
+    var sampler: FrameSampler = .{};
+    sampler.note(1);
+    sampler.note(11);
+    sampler.note(31);
+    sampler.note(61);
+    sampler.note(101);
+    const summary = sampler.summarize().?;
+    try std.testing.expectEqual(@as(usize, 4), summary.samples);
+    try std.testing.expectEqual(@as(u64, 25), summary.average_ns);
+    try std.testing.expectEqual(@as(u64, 10), summary.min_ns);
+    try std.testing.expectEqual(@as(u64, 40), summary.max_ns);
+    try std.testing.expectEqual(@as(u64, 40), summary.p95_ns);
+    try std.testing.expectEqual(@as(u64, 40), summary.p99_ns);
+}
+
+test "empty sampler has no summary" {
+    const sampler: FrameSampler = .{};
+    try std.testing.expect(sampler.summarize() == null);
 }
