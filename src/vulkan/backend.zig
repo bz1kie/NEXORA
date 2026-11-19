@@ -8229,6 +8229,11 @@ pub const Renderer = struct {
         self.frame_rate_counter = .{};
     }
 
+    /// Export captured guest flip intervals as frame_ms CSV.
+    pub fn writeNexoraFrameCsv(self: *const Renderer, writer: anytype) !void {
+        try self.nexora_frame_sampler.writeCsv(writer);
+    }
+
     /// Selects the registered display-buffer allocation named by a flip. With
     /// no resolver the most recently completed target is retained for isolated
     /// DCB tests.
