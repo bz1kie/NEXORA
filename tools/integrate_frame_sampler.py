@@ -11,6 +11,14 @@ replacements = [
         "    nexora_frame_sampler: @import(\"frame_sampler.zig\").FrameSampler = .{},",
     ),
     (
+        "    /// Selects the registered display-buffer allocation named by a flip.",
+        "    /// Export captured guest flip intervals as frame_ms CSV.\\n"
+        "    pub fn writeNexoraFrameCsv(self: *const Renderer, writer: anytype) !void {\\n"
+        "        try self.nexora_frame_sampler.writeCsv(writer);\\n"
+        "    }\\n\\n"
+        "    /// Selects the registered display-buffer allocation named by a flip.",
+    ),
+    (
         "        const now = hostTimestampNs();\n"
         "        if (self.frame_rate_sink) |sink| {",
         "        const now = hostTimestampNs();\n"
