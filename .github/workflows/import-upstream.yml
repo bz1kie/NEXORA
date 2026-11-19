@@ -2,6 +2,10 @@ name: Import upstream PS5PCEM history
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/import-upstream.yml'
 
 permissions:
   contents: write
@@ -10,17 +14,25 @@ jobs:
   import-upstream:
     runs-on: ubuntu-latest
     steps:
-      - name: Fetch upstream history without executing upstream code
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Checkout NEXORA with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream source and history into a review branch
         shell: bash
+        env:
+          IMPORT_BRANCH: import/ps5pcem-upstream-${{ github.run_id }}
         run: |
           set -euo pipefail
-          git init nexora-import
-          cd nexora-import
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/iStark/PS5PCEM.git
-          git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
-          git remote add nexora "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          # Never force-push or overwrite an existing import branch.
-          git push nexora refs/remotes/upstream/main:refs/heads/import/ps5pcem-upstream
-          echo "Imported upstream main into import/ps5pcem-upstream"
+          git fetch --no-tags upstream main
+          git switch -c "$IMPORT_BRANCH"
+          # Preserve both histories; keep NEXORA's README/LICENSE on text conflicts.
+          git merge --allow-unrelated-histories -X ours --no-edit upstream/main
+          # No force push, no changes to main or the profiler branch.
+          git push origin "HEAD:refs/heads/$IMPORT_BRANCH"
+          echo "Imported source and history to $IMPORT_BRANCH" >> "$GITHUB_STEP_SUMMARY"
