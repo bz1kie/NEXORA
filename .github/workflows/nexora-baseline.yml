@@ -1,0 +1,22 @@
+name: NEXORA baseline build
+
+on:
+  push:
+    branches: [feature/nexora-build-baseline]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-baseline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: '0.16.0'
+      - name: Build emulator (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
