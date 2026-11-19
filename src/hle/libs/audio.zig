@@ -1,0 +1,5009 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Guest audio services and the host AudioOut backend.
+//!
+//! AudioOut preserves independent host streams for concurrent guest ports;
+//! AudioIn validates and paces silent capture. AudioOut2
+//! does the same for its context/port queue model and reports a connected
+//! primary port from `sceAudioOut2PortGetState`. AJM executes ATRAC9 and MP3
+//! decode jobs through stateful host codec instances.
+
+const std = @import("std");
+
+/// Set to true to enable verbose per-frame audio debug logging.
+const log_verbose_audio = false;
+const builtin = @import("builtin");
+const abi = @import("../abi.zig");
+const trace = @import("../trace.zig");
+const errno = @import("../errno.zig");
+const symbols = @import("../symbols.zig");
+const kernel_threading = @import("kernel_threading.zig");
+const kernel_memory = @import("kernel_memory.zig");
+const audio_device = @import("../audio_device.zig");
+const audio_fs = @import("../audio_fs.zig");
+const ngs2_pcm = @import("../ngs2_pcm.zig");
+const ngs2_atrac9 = @import("../ngs2_atrac9.zig");
+const ngs2_waveform = @import("../ngs2_waveform.zig");
+const ngs2_geom = @import("../ngs2_geom.zig");
+const ajm_codec = @import("../ajm_codec.zig");
+const acm_convolution = @import("../acm_convolution.zig");
+const services = @import("services.zig");
+const filesystem = @import("../filesystem.zig");
+
+pub const default_host_target_latency_ms = audio_device.default_target_latency_ms;
+
+const audio_out_error_invalid_port: i32 = @bitCast(@as(u32, 0x8026_0003));
+const audio_out_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x8026_0004));
+const audio_out_error_port_full: i32 = @bitCast(@as(u32, 0x8026_0005));
+const audio_out_error_invalid_size: i32 = @bitCast(@as(u32, 0x8026_0006));
+const audio_out_error_invalid_format: i32 = @bitCast(@as(u32, 0x8026_0007));
+const audio_out_error_invalid_frequency: i32 = @bitCast(@as(u32, 0x8026_0008));
+const audio_out_error_invalid_port_type: i32 = @bitCast(@as(u32, 0x8026_000A));
+
+const audio_in_error_invalid_handle: i32 = @bitCast(@as(u32, 0x8026_0101));
+const audio_in_error_invalid_size: i32 = @bitCast(@as(u32, 0x8026_0102));
+const audio_in_error_invalid_frequency: i32 = @bitCast(@as(u32, 0x8026_0103));
+const audio_in_error_invalid_pointer: i32 = @bitCast(@as(u32, 0x8026_0105));
+const audio_in_error_invalid_parameter: i32 = @bitCast(@as(u32, 0x8026_0106));
+const audio_in_error_port_full: i32 = @bitCast(@as(u32, 0x8026_0107));
+
+const audio_out2_error_invalid_parameter: i32 = @bitCast(@as(u32, 0x8026_8001));
+const audio_out2_error_port_full: i32 = @bitCast(@as(u32, 0x8026_8012));
+const audio_out2_error_not_ready: i32 = @bitCast(@as(u32, 0x8026_8008));
+
+const ajm_error_invalid_context: i32 = @bitCast(@as(u32, 0x8093_0002));
+const ajm_error_invalid_parameter: i32 = @bitCast(@as(u32, 0x8093_0005));
+const ajm_error_codec_not_supported: i32 = @bitCast(@as(u32, 0x8093_0008));
+const ajm_error_job_creation: i32 = @bitCast(@as(u32, 0x8093_0012));
+const ajm_result_invalid_parameter: i32 = 0x0000_0004;
+const ngs2_error_invalid_output: i32 = @bitCast(@as(u32, 0x804a_0053));
+
+const audiodec_error_invalid_type: i32 = @bitCast(@as(u32, 0x807f_0001));
+const audiodec_error_argument: i32 = @bitCast(@as(u32, 0x807f_0002));
+const audiodec_error_invalid_param_size: i32 = @bitCast(@as(u32, 0x807f_0004));
+const audiodec_error_invalid_bsi_info_size: i32 = @bitCast(@as(u32, 0x807f_0005));
+const audiodec_error_invalid_au_info_size: i32 = @bitCast(@as(u32, 0x807f_0006));
+const audiodec_error_invalid_pcm_item_size: i32 = @bitCast(@as(u32, 0x807f_0007));
+const audiodec_error_invalid_ctrl_pointer: i32 = @bitCast(@as(u32, 0x807f_0008));
+const audiodec_error_invalid_param_pointer: i32 = @bitCast(@as(u32, 0x807f_0009));
+const audiodec_error_invalid_bsi_info_pointer: i32 = @bitCast(@as(u32, 0x807f_000a));
+const audiodec_error_invalid_au_info_pointer: i32 = @bitCast(@as(u32, 0x807f_000b));
+const audiodec_error_invalid_pcm_item_pointer: i32 = @bitCast(@as(u32, 0x807f_000c));
+const audiodec_error_invalid_au_pointer: i32 = @bitCast(@as(u32, 0x807f_000d));
+const audiodec_error_invalid_pcm_pointer: i32 = @bitCast(@as(u32, 0x807f_000e));
+const audiodec_error_invalid_handle: i32 = @bitCast(@as(u32, 0x807f_000f));
+const audiodec_error_invalid_word_length: i32 = @bitCast(@as(u32, 0x807f_0010));
+const audiodec_error_invalid_au_size: i32 = @bitCast(@as(u32, 0x807f_0011));
+const audiodec_error_invalid_pcm_size: i32 = @bitCast(@as(u32, 0x807f_0012));
+
+const Lock = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *Lock) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *Lock) void {
+        self.inner.unlock();
+    }
+};
+
+fn formatChannels(format: u32) ?u8 {
+    return switch (format & 0xff) {
+        0, 3 => 1,
+        1, 4 => 2,
+        2, 5, 6, 7 => 8,
+        else => null,
+    };
+}
+
+fn pace(frames: u32, frequency: u32) void {
+    if (frames == 0 or frequency == 0) return;
+    const duration = (@as(u64, frames) * std.time.us_per_s) / frequency;
+    const microseconds: u32 = @intCast(@min(duration, std.math.maxInt(u32)));
+    _ = kernel_threading.sceKernelUsleep(@max(microseconds, 1));
+}
+
+/// Whether a format carries integer or floating-point samples.
+///
+/// The low byte selects both channel count and representation, and the two are
+/// not separable: the same number names a different layout depending on which
+/// half of the table it falls in.
+fn formatSamples(format: u32) ?audio_device.SampleFormat {
+    return switch (format & 0xff) {
+        0, 1, 2, 6 => .signed16,
+        3, 4, 5, 7 => .float32,
+        else => null,
+    };
+}
+
+const PortKind = enum(u8) { none, output, input };
+const LegacyPort = struct {
+    kind: PortKind = .none,
+    frames: u32 = 0,
+    frequency: u32 = 0,
+    channels: u8 = 0,
+    samples: audio_device.SampleFormat = .signed16,
+    generation: u64 = 0,
+};
+
+/// AudioOut2 contexts retain their own mixed output path. Legacy ports use
+/// independent streams below so music and effects reach the Windows mixer
+/// concurrently instead of taking ownership away from one another.
+var device: audio_device.Device = .{};
+var device_owner = std.atomic.Value(i32).init(-1);
+var device_owner_last_signal_ms = std.atomic.Value(u64).init(0);
+var device_mutex: std.Io.Mutex = .init;
+var host_target_latency_ms = std.atomic.Value(u16).init(audio_device.default_target_latency_ms);
+
+extern "kernel32" fn GetTickCount64() callconv(.winapi) u64;
+
+fn audioClockMilliseconds() u64 {
+    return if (comptime builtin.os.tag == .windows) GetTickCount64() else 0;
+}
+
+fn hostTimestampNs() u64 {
+    if (comptime builtin.os.tag != .windows) return 0;
+    var counter: std.os.windows.LARGE_INTEGER = 0;
+    var frequency: std.os.windows.LARGE_INTEGER = 0;
+    if (!std.os.windows.ntdll.RtlQueryPerformanceCounter(&counter).toBool() or
+        !std.os.windows.ntdll.RtlQueryPerformanceFrequency(&frequency).toBool() or
+        counter < 0 or frequency <= 0)
+    {
+        return 0;
+    }
+    const scaled = @as(u128, @intCast(counter)) * std.time.ns_per_s;
+    return @intCast(scaled / @as(u128, @intCast(frequency)));
+}
+
+/// Selects the host jitter reserve before a title opens its primary port.
+/// A per-title profile can tolerate measured mixer gaps without imposing that
+/// latency on every other game.
+pub fn setHostTargetLatencyMilliseconds(milliseconds: u16) void {
+    host_target_latency_ms.store(@max(milliseconds, 1), .release);
+    @import("audio3d.zig").setHostTargetLatencyMilliseconds(@max(milliseconds, 1));
+}
+
+fn lockDevice() ?std.Io {
+    const io = filesystem.attachedIo() orelse return null;
+    device_mutex.lockUncancelable(io);
+    return io;
+}
+
+fn unlockDevice(io: std.Io) void {
+    device_mutex.unlock(io);
+}
+
+const LegacyOutput = struct {
+    device: audio_device.Device = .{},
+    mutex: std.Io.Mutex = .init,
+    generation: std.atomic.Value(u64) = .init(0),
+};
+
+var legacy_outputs: [maximum_legacy_ports]LegacyOutput = @splat(.{});
+var next_legacy_generation: u64 = 0; // protected by port_mutex
+var fallback_output_owner = std.atomic.Value(i32).init(-1);
+
+fn releaseLegacyOutput(handle: i32) void {
+    const output = &legacy_outputs[@intCast(handle - 1)];
+    const io = filesystem.attachedIo();
+    if (io) |attached| output.mutex.lockUncancelable(attached);
+    defer if (io) |attached| output.mutex.unlock(attached);
+    output.generation.store(0, .release);
+    output.device.close();
+    _ = fallback_output_owner.cmpxchgStrong(handle, -1, .acq_rel, .acquire);
+}
+
+const maximum_legacy_ports = 64;
+var port_mutex: Lock = .{};
+var legacy_ports: [maximum_legacy_ports]LegacyPort = [_]LegacyPort{.{}} ** maximum_legacy_ports;
+
+fn allocateLegacyPort(
+    kind: PortKind,
+    frames: u32,
+    frequency: u32,
+    channels: u8,
+    samples: audio_device.SampleFormat,
+) ?i32 {
+    port_mutex.lock();
+    defer port_mutex.unlock();
+    for (&legacy_ports, 0..) |*port, index| {
+        if (port.kind != .none) continue;
+        next_legacy_generation +%= 1;
+        if (next_legacy_generation == 0) next_legacy_generation = 1;
+        port.* = .{
+            .generation = next_legacy_generation,
+            .kind = kind,
+            .frames = frames,
+            .frequency = frequency,
+            .channels = channels,
+            .samples = samples,
+        };
+        const handle: i32 = @intCast(index + 1);
+        if (kind == .output) legacy_outputs[index].generation.store(port.generation, .release);
+        return handle;
+    }
+    return null;
+}
+
+fn legacyPort(handle: i32, kind: PortKind) ?LegacyPort {
+    if (handle <= 0 or handle > maximum_legacy_ports) return null;
+    port_mutex.lock();
+    defer port_mutex.unlock();
+    const port = legacy_ports[@intCast(handle - 1)];
+    return if (port.kind == kind) port else null;
+}
+
+fn releaseLegacyPort(handle: i32, kind: PortKind) bool {
+    if (handle <= 0 or handle > maximum_legacy_ports) return false;
+    port_mutex.lock();
+    defer port_mutex.unlock();
+    const port = &legacy_ports[@intCast(handle - 1)];
+    if (port.kind != kind) return false;
+    if (kind == .output) releaseLegacyOutput(handle);
+    port.* = .{};
+    return true;
+}
+
+const AudioOutPortState = extern struct {
+    output: u16 = 0,
+    channel: u8 = 0,
+    reserved1: u8 = 0,
+    volume: i16 = 0,
+    reroute_counter: u16 = 0,
+    flag: u64 = 0,
+    reserved2: [2]u64 = .{ 0, 0 },
+};
+
+fn audioOutInit() callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn audioOutOpen(_: i32, port_type: i32, index: i32, frames: u32, frequency: u32, format: u32) callconv(abi.guest) i32 {
+    if (port_type < 0 or (port_type > 4 and port_type != 10 and port_type != 127)) return audio_out_error_invalid_port_type;
+    if (index != 0) return audio_out_error_invalid_port_type;
+    if (frames == 0) return audio_out_error_invalid_size;
+    if (frequency == 0) return audio_out_error_invalid_frequency;
+    const channels = formatChannels(format) orelse return audio_out_error_invalid_format;
+    const samples = formatSamples(format) orelse return audio_out_error_invalid_format;
+    return allocateLegacyPort(.output, frames, frequency, channels, samples) orelse
+        audio_out_error_port_full;
+}
+
+fn audioOutSetVolume(handle: i32, _: u32, volumes: ?[*]const i32) callconv(abi.guest) i32 {
+    if (legacyPort(handle, .output) == null) return audio_out_error_invalid_port;
+    if (volumes == null) return audio_out_error_invalid_pointer;
+    return errno.ok;
+}
+
+fn audioOutSetMixLevelPadSpeaker(handle: i32, _: f32) callconv(abi.guest) i32 {
+    return if (legacyPort(handle, .output) != null) errno.ok else audio_out_error_invalid_port;
+}
+
+/// Hands one buffer of samples over, and takes about as long as it will sound.
+///
+/// The wait is what a title keeps time with, so it happens either way: the
+/// device provides it by making room for the next buffer, and where there is no
+/// device it is a sleep, exactly as before. A title cannot tell which, and must
+/// not be able to.
+var audio_out_play_ok: std.atomic.Value(u64) = .init(0);
+var audio_out_play_fail: std.atomic.Value(u64) = .init(0);
+var audio_test_tone_phase: f32 = 0;
+/// Set once from `PS5_AUDIO_TEST_TONE=1` вЂ” inject a quiet 440 Hz tone when the
+/// title submits silent buffers so host speakers can be verified.
+var audio_test_tone_enabled: ?bool = null;
+var audio_disabled: ?bool = null;
+
+extern "kernel32" fn GetEnvironmentVariableA(
+    name: [*:0]const u8,
+    buffer: ?[*]u8,
+    size: u32,
+) callconv(.winapi) u32;
+
+fn audioTestToneEnabled() bool {
+    if (audio_test_tone_enabled) |value| return value;
+    var on = false;
+    if (comptime builtin.os.tag == .windows) {
+        var buf: [8]u8 = undefined;
+        const n = GetEnvironmentVariableA("PS5_AUDIO_TEST_TONE", &buf, buf.len);
+        if (n > 0 and n < buf.len) {
+            on = buf[0] != '0' and buf[0] != 'n' and buf[0] != 'N';
+        }
+    } else if (posixFlag("PS5_AUDIO_TEST_TONE")) |value| {
+        on = value;
+    }
+    audio_test_tone_enabled = on;
+    if (on) std.debug.print("[audio] PS5_AUDIO_TEST_TONE: inject 440 Hz on silent buffers\n", .{});
+    return on;
+}
+
+pub fn audioDisabled() bool {
+    if (audio_disabled) |value| return value;
+    var disabled = false;
+    if (comptime builtin.os.tag == .windows) {
+        var buf: [8]u8 = undefined;
+        const n = GetEnvironmentVariableA("PS5_AUDIO_DISABLED", &buf, buf.len);
+        if (n > 0 and n < buf.len) disabled = buf[0] != '0' and buf[0] != 'n' and buf[0] != 'N';
+    } else if (posixFlag("PS5_AUDIO_DISABLED")) |value| {
+        disabled = value;
+    }
+    audio_disabled = disabled;
+    return disabled;
+}
+
+/// A yes/no environment switch on Linux, read through libc.
+fn posixFlag(comptime name: [:0]const u8) ?bool {
+    if (comptime builtin.os.tag != .linux or !builtin.link_libc) return null;
+    const value = std.mem.span(std.c.getenv(name) orelse return null);
+    if (value.len == 0) return null;
+    return value[0] != '0' and value[0] != 'n' and value[0] != 'N';
+}
+
+fn readF32Le(bytes: *const [4]u8) f32 {
+    return @bitCast(std.mem.readInt(u32, bytes, .little));
+}
+
+fn writeF32Le(bytes: *[4]u8, value: f32) void {
+    std.mem.writeInt(u32, bytes, @bitCast(value), .little);
+}
+
+fn bufferPeak(port: LegacyPort, bytes: []const u8) u32 {
+    var peak: u32 = 0;
+    if (port.samples == .signed16) {
+        var offset: usize = 0;
+        while (offset + 2 <= bytes.len) : (offset += 2) {
+            const s = std.mem.readInt(i16, bytes[offset..][0..2], .little);
+            peak = @max(peak, @as(u32, @intCast(@abs(s))));
+        }
+    } else {
+        var offset: usize = 0;
+        while (offset + 4 <= bytes.len) : (offset += 4) {
+            const s = readF32Le(bytes[offset..][0..4]);
+            const a: f32 = if (s < 0) -s else s;
+            peak = @max(peak, @as(u32, @intFromFloat(@min(a * 32768.0, 65535.0))));
+        }
+    }
+    return peak;
+}
+
+/// Quiet 440 Hz tone used only when `PS5_AUDIO_TEST_TONE` is set and the title
+/// buffer is effectively silent.
+fn fillTestTone(port: LegacyPort, dest: []u8) void {
+    const frames = port.frames;
+    const ch = port.channels;
+    const two_pi = 2.0 * std.math.pi;
+    const step = two_pi * 440.0 / @as(f32, @floatFromInt(port.frequency));
+    var frame: u32 = 0;
+    var phase = audio_test_tone_phase;
+    while (frame < frames) : (frame += 1) {
+        const sample = @sin(phase) * 0.15;
+        phase += step;
+        if (phase > two_pi) phase -= two_pi;
+        var c: u8 = 0;
+        while (c < ch) : (c += 1) {
+            if (port.samples == .signed16) {
+                const i: i16 = @intFromFloat(sample * 8000.0);
+                const off = (@as(usize, frame) * ch + c) * 2;
+                if (off + 2 > dest.len) return;
+                std.mem.writeInt(i16, dest[off..][0..2], i, .little);
+            } else {
+                const off = (@as(usize, frame) * ch + c) * 4;
+                if (off + 4 > dest.len) return;
+                writeF32Le(dest[off..][0..4], sample);
+            }
+        }
+    }
+    audio_test_tone_phase = phase;
+}
+
+/// Submit one independent legacy stream. Each stream owns its PCM and wait
+/// lock; a music producer cannot reset or block a concurrently active SFX port.
+fn submitLegacyOutput(handle: i32, port: LegacyPort, samples: *const anyopaque) bool {
+    if (audioDisabled()) return false;
+    const io = filesystem.attachedIo() orelse return false;
+    const output = &legacy_outputs[@intCast(handle - 1)];
+    output.mutex.lockUncancelable(io);
+    defer output.mutex.unlock(io);
+    // Close/reopen may have reused this integer handle while the producer
+    // waited for its stream lock. Never feed an old call into a new port.
+    if (output.generation.load(.acquire) != port.generation) return false;
+    _ = fallback_output_owner.cmpxchgStrong(-1, handle, .acq_rel, .acquire);
+    const owns_fallback = fallback_output_owner.load(.acquire) == handle;
+    if (!output.device.isOpen()) {
+        if (owns_fallback) filesystem.ensureAudioIndexed();
+        output.device.diagnostic_id = handle;
+        output.device.open(.{
+            .frequency = port.frequency,
+            .channels = port.channels,
+            .format = port.samples,
+            .frames = port.frames,
+            .target_latency_ms = host_target_latency_ms.load(.acquire),
+        }) catch |err| {
+            const n = audio_out_play_fail.fetchAdd(1, .monotonic);
+            if (n < 5) std.debug.print("[audio] stream open failed handle={d}: {s}\n", .{ handle, @errorName(err) });
+            return false;
+        };
+        std.debug.print("[audio] stream open handle={d} {d}Hz ch={d} fmt={s} frames={d} queue={d}\n", .{
+            handle, port.frequency, port.channels, @tagName(port.samples), port.frames, output.device.queueCapacity(),
+        });
+    }
+
+    const length = port.frames * @as(u32, port.channels) * port.samples.bytes();
+    const bytes: [*]const u8 = @ptrCast(samples);
+    var play_slice = bytes[0..length];
+    const source_peak = bufferPeak(port, play_slice);
+    var mixed_storage: [audio_device.maximum_buffer_bytes]u8 align(16) = undefined;
+    if (owns_fallback and source_peak < 8 and length <= mixed_storage.len) {
+        if (audioTestToneEnabled()) {
+            @memcpy(mixed_storage[0..length], play_slice);
+            fillTestTone(port, mixed_storage[0..length]);
+            play_slice = mixed_storage[0..length];
+        } else if (audio_fs.isMixLive()) {
+            filesystem.ensureAudioMixAfterPresent();
+            if (audio_fs.isMixLive()) {
+                @memcpy(mixed_storage[0..length], play_slice);
+                const mixed = if (port.samples == .float32)
+                    audio_fs.mixIntoFloat32Buffer(mixed_storage[0..length], port.channels)
+                else
+                    audio_fs.mixIntoInt16Buffer(mixed_storage[0..length], port.channels);
+                if (mixed) play_slice = mixed_storage[0..length];
+            }
+        }
+    }
+    output.device.play(play_slice) catch |err| {
+        const n = audio_out_play_fail.fetchAdd(1, .monotonic);
+        if (n < 5) std.debug.print("[audio] play failed #{d} handle={d}: {s}\n", .{ n + 1, handle, @errorName(err) });
+        return false;
+    };
+    _ = audio_out_play_ok.fetchAdd(1, .monotonic);
+    return true;
+}
+
+fn audioOutOutput(handle: i32, data: ?*const anyopaque) callconv(abi.guest) i32 {
+    const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
+    if (data) |samples| {
+        const length = @as(u64, port.frames) * port.channels * port.samples.bytes();
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(samples), length)) return audio_out_error_invalid_pointer;
+        if (submitLegacyOutput(handle, port, samples)) return errno.ok;
+    }
+    pace(port.frames, port.frequency);
+    return errno.ok;
+}
+
+const AudioOutOutputParam = extern struct {
+    handle: i32,
+    padding: u32,
+    data: u64,
+};
+
+fn audioOutOutputs(parameters: ?[*]const AudioOutOutputParam, count: u32) callconv(abi.guest) i32 {
+    if (count == 0 or count > 25) return audio_out_error_port_full;
+    const list = parameters orelse return audio_out_error_invalid_pointer;
+    const byte_size = @as(u64, count) * @sizeOf(AudioOutOutputParam);
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(list), byte_size)) {
+        return audio_out_error_invalid_pointer;
+    }
+
+    // Validate the complete batch before submitting its first buffer. A bad
+    // later descriptor must not leave the host device with a partial batch.
+    var frames: ?u32 = null;
+    var frequency: u32 = 0;
+    var ports: [25]LegacyPort = undefined;
+    for (list[0..count], 0..) |entry, index| {
+        const port = legacyPort(entry.handle, .output) orelse return audio_out_error_invalid_port;
+        ports[index] = port;
+        if (frames) |expected| {
+            if (port.frames != expected) return audio_out_error_invalid_size;
+        } else {
+            frames = port.frames;
+            frequency = port.frequency;
+        }
+        for (list[0..index]) |previous| {
+            if (previous.handle == entry.handle) return audio_out_error_invalid_port;
+        }
+        if (entry.data != 0) {
+            const length = @as(u64, port.frames) * port.channels * port.samples.bytes();
+            if (!kernel_memory.isGuestRangeAccessible(entry.data, length)) return audio_out_error_invalid_pointer;
+        }
+    }
+
+    // Submit every stream in this quantum. The independent host queues play
+    // concurrently; a silent/null auxiliary port must not add another sleep.
+    var played = false;
+    for (list[0..count], 0..) |entry, index| {
+        if (entry.data == 0) continue;
+        played = submitLegacyOutput(entry.handle, ports[index], @ptrFromInt(entry.data)) or played;
+    }
+    if (!played) pace(frames.?, frequency);
+    return errno.ok;
+}
+
+fn audioOutClose(handle: i32) callconv(abi.guest) i32 {
+    return if (releaseLegacyPort(handle, .output)) errno.ok else audio_out_error_invalid_port;
+}
+
+fn audioOutGetPortState(handle: i32, state: ?*AudioOutPortState) callconv(abi.guest) i32 {
+    const port = legacyPort(handle, .output) orelse return audio_out_error_invalid_port;
+    const output = state orelse return audio_out_error_invalid_pointer;
+    output.* = .{ .output = 1, .channel = port.channels };
+    return errno.ok;
+}
+
+const audio_out_exports = [_]symbols.Export{
+    .{ .name = "sceAudioOutInit", .function = trace.wrap("sceAudioOutInit", &audioOutInit), .expect_id = "JfEPXVxhFqA" },
+    .{ .name = "sceAudioOutOpen", .function = trace.wrap("sceAudioOutOpen", &audioOutOpen), .expect_id = "ekNvsT22rsY" },
+    .{ .name = "sceAudioOutSetVolume", .function = trace.wrap("sceAudioOutSetVolume", &audioOutSetVolume), .expect_id = "b+uAV89IlxE" },
+    .{ .name = "sceAudioOutSetMixLevelPadSpk", .function = trace.wrap("sceAudioOutSetMixLevelPadSpk", &audioOutSetMixLevelPadSpeaker), .expect_id = "wVwPU50pS1c" },
+    .{ .name = "sceAudioOutOutput", .function = trace.wrap("sceAudioOutOutput", &audioOutOutput), .expect_id = "QOQtbeDqsT4" },
+    .{ .name = "sceAudioOutOutputs", .function = trace.wrap("sceAudioOutOutputs", &audioOutOutputs), .expect_id = "w3PdaSTSwGE" },
+    .{ .name = "sceAudioOutClose", .function = trace.wrap("sceAudioOutClose", &audioOutClose), .expect_id = "s1--uE9mBFw" },
+    .{ .name = "sceAudioOutGetPortState", .function = trace.wrap("sceAudioOutGetPortState", &audioOutGetPortState), .expect_id = "GrQ9s4IrNaQ" },
+};
+
+fn audioInOpen(_: i32, _: u32, _: u32, frames: u32, frequency: u32, parameter: u32) callconv(abi.guest) i32 {
+    if (frames == 0) return audio_in_error_invalid_size;
+    if (frequency == 0) return audio_in_error_invalid_frequency;
+    const channels: u8 = switch (parameter & 0xff) {
+        0 => 1,
+        1 => 2,
+        else => return audio_in_error_invalid_parameter,
+    };
+    return allocateLegacyPort(.input, frames, frequency, channels, .signed16) orelse
+        audio_in_error_port_full;
+}
+
+fn audioInInput(handle: i32, destination: ?[*]u8) callconv(abi.guest) i32 {
+    const port = legacyPort(handle, .input) orelse return audio_in_error_invalid_handle;
+    const output = destination orelse return audio_in_error_invalid_pointer;
+    @memset(output[0 .. @as(usize, port.frames) * port.channels * @sizeOf(i16)], 0);
+    pace(port.frames, port.frequency);
+    return @intCast(port.frames);
+}
+
+fn audioInClose(handle: i32) callconv(abi.guest) i32 {
+    return if (releaseLegacyPort(handle, .input)) errno.ok else audio_in_error_invalid_handle;
+}
+
+fn audioInGetSilentState(handle: i32) callconv(abi.guest) i32 {
+    return if (legacyPort(handle, .input) != null) 1 else audio_in_error_invalid_handle;
+}
+
+const audio_in_exports = [_]symbols.Export{
+    .{ .name = "sceAudioInOpen", .function = trace.wrap("sceAudioInOpen", &audioInOpen), .expect_id = "5NE8Sjc7VC8" },
+    .{ .name = "sceAudioInInput", .function = trace.wrap("sceAudioInInput", &audioInInput), .expect_id = "LozEOU8+anM" },
+    .{ .name = "sceAudioInClose", .function = trace.wrap("sceAudioInClose", &audioInClose), .expect_id = "Jh6WbHhnI68" },
+    .{ .name = "sceAudioInGetSilentState", .function = trace.wrap("sceAudioInGetSilentState", &audioInGetSilentState), .expect_id = "BohEAQ7DlUE" },
+    // SDK 11 imports the close entry under a new identifier while retaining
+    // the same one-handle ABI.
+    .{ .name = "libSceAudioIn:X+4jdIS75P0", .function = trace.wrap("sceAudioInCloseGen5", &audioInClose), .id_override = "X+4jdIS75P0" },
+    .{ .name = "sceAudioInAsyncOpen", .function = trace.wrap("sceAudioInAsyncOpen", &audioInOpen), .expect_id = "3YQ1qY5ePUk" },
+};
+
+// libSceAudioOut2 ----------------------------------------------------------
+
+const AudioOut2ContextParam = extern struct {
+    max_ports: u32 = 0,
+    max_object_ports: u32 = 0,
+    guarantee_object_ports: u32 = 0,
+    queue_depth: u32 = 0,
+    num_grains: u32 = 0,
+    flags: u32 = 0,
+    reserved: [10]u32 = [_]u32{0} ** 10,
+};
+
+const AudioOut2PortParam = extern struct {
+    port_type: u16,
+    padding: u16,
+    data_format: u32,
+    sampling_frequency: u32,
+    flags: u32,
+    user_handle: usize,
+    reserved: [10]u32,
+};
+
+const AudioObjectKind = enum(u8) { none, context, port, user };
+const AudioObject = struct {
+    kind: AudioObjectKind = .none,
+    parent: u64 = 0,
+    queue_depth: u32 = 0,
+    grains: u32 = 0,
+    frequency: u32 = 48_000,
+    data_format: u32 = 0,
+    port_type: u16 = 0,
+    pcm_address: u64 = 0,
+    pcm_pending: bool = false,
+    queued_grains: u32 = 0,
+    queue_updated_ns: u64 = 0,
+};
+
+const maximum_audio_objects = 512;
+var audio_object_mutex: Lock = .{};
+var audio_objects: [maximum_audio_objects]AudioObject = [_]AudioObject{.{}} ** maximum_audio_objects;
+
+fn allocateAudioObject(kind: AudioObjectKind, parent: u64, queue_depth: u32, grains: u32) ?u64 {
+    audio_object_mutex.lock();
+    defer audio_object_mutex.unlock();
+    for (&audio_objects, 0..) |*object, index| {
+        if (object.kind != .none) continue;
+        object.* = .{
+            .kind = kind,
+            .parent = parent,
+            .queue_depth = queue_depth,
+            .grains = grains,
+        };
+        return index + 1;
+    }
+    return null;
+}
+
+fn audioObject(handle: u64, kind: AudioObjectKind) ?AudioObject {
+    if (handle == 0 or handle > maximum_audio_objects) return null;
+    audio_object_mutex.lock();
+    defer audio_object_mutex.unlock();
+    const object = audio_objects[@intCast(handle - 1)];
+    return if (object.kind == kind) object else null;
+}
+
+fn releaseAudioObject(handle: u64, kind: AudioObjectKind) bool {
+    if (handle == 0 or handle > maximum_audio_objects) return false;
+    audio_object_mutex.lock();
+    defer audio_object_mutex.unlock();
+    const object = &audio_objects[@intCast(handle - 1)];
+    if (object.kind != kind) return false;
+    object.* = .{};
+    if (kind == .context) {
+        for (&audio_objects) |*child| if (child.kind == .port and child.parent == handle) {
+            child.* = .{};
+        };
+        const owner_tag: i32 = @bitCast(@as(u32, 0x8000_0000) | @as(u32, @truncate(handle)));
+        if (device_owner.load(.acquire) == owner_tag) {
+            if (lockDevice()) |io| {
+                defer unlockDevice(io);
+                if (device_owner.load(.acquire) == owner_tag) {
+                    device.close();
+                    device_owner.store(-1, .release);
+                    device_owner_last_signal_ms.store(0, .release);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+const AudioOut2AttributeEntry = extern struct {
+    attribute_id: u32,
+    padding: u32,
+    value_address: u64,
+    value_size: u64,
+};
+
+const AudioOut2DecodedFormat = struct {
+    channels: u8,
+    bytes_per_sample: u8,
+    is_float: bool,
+};
+
+fn decodeAudioOut2Format(data_format: u32) ?AudioOut2DecodedFormat {
+    var channels: u8 = @truncate((data_format >> 8) & 0xff);
+    if (channels == 0) channels = 2;
+    if (channels < 1 or channels > 16) return null;
+    const data_type = data_format & 0x7f;
+    const is_float = (data_type == 0);
+    const bytes_per_sample: u8 = if (is_float) 4 else if (data_type == 1) 2 else return null;
+    return .{
+        .channels = channels,
+        .bytes_per_sample = bytes_per_sample,
+        .is_float = is_float,
+    };
+}
+
+fn readAudioOut2Sample(bytes: []const u8, is_float: bool, bytes_per_sample: usize) f32 {
+    if (is_float) {
+        if (bytes.len < 4) return 0.0;
+        const val: f32 = @bitCast(std.mem.readInt(u32, bytes[0..4], .little));
+        return if (std.math.isFinite(val)) val else 0.0;
+    } else {
+        if (bytes_per_sample == 2) {
+            if (bytes.len < 2) return 0.0;
+            const val = std.mem.readInt(i16, bytes[0..2], .little);
+            return @as(f32, @floatFromInt(val)) / 32768.0;
+        }
+        return 0.0;
+    }
+}
+
+fn mixAudioOut2Port(
+    source: []const u8,
+    mix: []f32,
+    frames: usize,
+    channels: usize,
+    bytes_per_sample: usize,
+    is_float: bool,
+    additive: bool,
+    peak_out: *f32,
+) void {
+    const frame_bytes = channels * bytes_per_sample;
+    const side: f32 = 0.70710678;
+    for (0..frames) |f| {
+        const offset = f * frame_bytes;
+        if (offset + frame_bytes > source.len) break;
+        const frame_slice = source[offset .. offset + frame_bytes];
+        var left: f32 = 0.0;
+        var right: f32 = 0.0;
+        if (channels >= 8) {
+            const fl = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const fr = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const c = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const bl = readAudioOut2Sample(frame_slice[4 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const br = readAudioOut2Sample(frame_slice[5 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const sl = readAudioOut2Sample(frame_slice[6 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const sr = readAudioOut2Sample(frame_slice[7 * bytes_per_sample ..], is_float, bytes_per_sample);
+            left = fl + c * side + bl * side + sl * side;
+            right = fr + c * side + br * side + sr * side;
+        } else if (channels >= 6) {
+            const fl = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const fr = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const c = readAudioOut2Sample(frame_slice[2 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const bl = readAudioOut2Sample(frame_slice[4 * bytes_per_sample ..], is_float, bytes_per_sample);
+            const br = readAudioOut2Sample(frame_slice[5 * bytes_per_sample ..], is_float, bytes_per_sample);
+            left = fl + c * side + bl * side;
+            right = fr + c * side + br * side;
+        } else if (channels == 1) {
+            const mono = readAudioOut2Sample(frame_slice, is_float, bytes_per_sample);
+            left = mono;
+            right = mono;
+        } else {
+            left = readAudioOut2Sample(frame_slice[0 * bytes_per_sample ..], is_float, bytes_per_sample);
+            right = readAudioOut2Sample(frame_slice[1 * bytes_per_sample ..], is_float, bytes_per_sample);
+        }
+
+        const abs_l = @abs(left);
+        const abs_r = @abs(right);
+        if (abs_l > peak_out.*) peak_out.* = abs_l;
+        if (abs_r > peak_out.*) peak_out.* = abs_r;
+
+        if (additive) {
+            mix[f * 2 + 0] += left;
+            mix[f * 2 + 1] += right;
+        } else {
+            mix[f * 2 + 0] = left;
+            mix[f * 2 + 1] = right;
+        }
+    }
+}
+
+var audio_out2_submit_count: u64 = 0;
+
+fn routeAndPlayAudioOut2(
+    context_handle: u64,
+    frequency: u32,
+    frames: u32,
+    pcm_bytes: []const u8,
+    peak: f32,
+) void {
+    if (audioDisabled()) return;
+    const freq = if (frequency == 0) 48_000 else frequency;
+    const owner_tag: i32 = @bitCast(@as(u32, 0x8000_0000) | @as(u32, @truncate(context_handle)));
+
+    const io = lockDevice() orelse return;
+    defer unlockDevice(io);
+
+    const current_owner = device_owner.load(.acquire);
+    if (current_owner != owner_tag) {
+        if (current_owner != -1) {
+            device.close();
+        }
+        device_owner.store(-1, .release);
+        device.open(.{
+            .frequency = freq,
+            .channels = 2,
+            .format = .signed16,
+            .frames = frames,
+            .target_latency_ms = host_target_latency_ms.load(.acquire),
+        }) catch |err| {
+            std.debug.print(
+                "[audio out2] host device open failed ctx=0x{x} {d}Hz frames={d}: {s}\n",
+                .{ context_handle, freq, frames, @errorName(err) },
+            );
+            return;
+        };
+        device_owner.store(owner_tag, .release);
+        device_owner_last_signal_ms.store(audioClockMilliseconds(), .release);
+        std.debug.print(
+            "[audio out2] host device open ok ctx=0x{x} {d}Hz frames={d} queue={d}\n",
+            .{ context_handle, freq, frames, device.queueCapacity() },
+        );
+    }
+
+    if (device.isOpen()) {
+        device.play(pcm_bytes) catch |err| {
+            const n = audio_out_play_fail.fetchAdd(1, .monotonic);
+            if (n < 5) {
+                std.debug.print("[audio out2] play failed #{d}: {s}\n", .{ n + 1, @errorName(err) });
+            }
+        };
+        const n = audio_out2_submit_count;
+        audio_out2_submit_count += 1;
+        if (n < 8 or n % 500 == 0) {
+            std.debug.print(
+                "[audio out2] submit #{d} ctx=0x{x} frames={d} peak={d:.3}\n",
+                .{ n, context_handle, frames, peak },
+            );
+        }
+    }
+}
+
+fn submitAudioOut2Context(context_handle: u64) bool {
+    const ctx = audioObject(context_handle, .context) orelse return false;
+    const frames = ctx.grains;
+    if (frames == 0 or frames > 4096) return false;
+
+    var mix_buffer: [4096 * 2]f32 = undefined;
+    @memset(mix_buffer[0 .. frames * 2], 0);
+
+    var ports_mixed: usize = 0;
+    var max_peak: f32 = 0.0;
+
+    audio_object_mutex.lock();
+    for (&audio_objects) |*p| {
+        if (p.kind != .port or p.parent != context_handle) continue;
+        if (!p.pcm_pending or p.pcm_address == 0) continue;
+        p.pcm_pending = false;
+        const pcm_addr = p.pcm_address;
+        const data_format = p.data_format;
+
+        const decoded = decodeAudioOut2Format(data_format) orelse continue;
+        const channels: usize = decoded.channels;
+        const bytes_per_sample: usize = decoded.bytes_per_sample;
+        const byte_length = @as(usize, frames) * channels * bytes_per_sample;
+        if (!kernel_memory.isGuestRangeAccessible(pcm_addr, byte_length)) continue;
+
+        const src_bytes: [*]const u8 = @ptrFromInt(pcm_addr);
+        mixAudioOut2Port(
+            src_bytes[0..byte_length],
+            mix_buffer[0 .. frames * 2],
+            frames,
+            channels,
+            bytes_per_sample,
+            decoded.is_float,
+            ports_mixed > 0,
+            &max_peak,
+        );
+        ports_mixed += 1;
+    }
+    audio_object_mutex.unlock();
+
+    if (ports_mixed == 0) return false;
+
+    var pcm16_buffer: [4096 * 2 * 2]u8 = undefined;
+    const pcm16_bytes = frames * 2 * 2;
+    for (0..frames) |i| {
+        const left = std.math.clamp(mix_buffer[i * 2], -1.0, 1.0);
+        const right = std.math.clamp(mix_buffer[i * 2 + 1], -1.0, 1.0);
+        const s_left: i16 = @intFromFloat(std.math.clamp(left * 32767.0, -32768.0, 32767.0));
+        const s_right: i16 = @intFromFloat(std.math.clamp(right * 32767.0, -32768.0, 32767.0));
+        std.mem.writeInt(i16, pcm16_buffer[i * 4 ..][0..2], s_left, .little);
+        std.mem.writeInt(i16, pcm16_buffer[i * 4 + 2 ..][0..2], s_right, .little);
+    }
+
+    routeAndPlayAudioOut2(context_handle, ctx.frequency, frames, pcm16_buffer[0..pcm16_bytes], max_peak);
+    return true;
+}
+
+fn updateAudioOut2Queue(context: *AudioObject, now: u64) void {
+    const frequency: u64 = if (context.frequency == 0) 48_000 else context.frequency;
+    const grain_ns = @max(1, @as(u64, context.grains) * std.time.ns_per_s / frequency);
+    const completed = @min(context.queued_grains, (now -| context.queue_updated_ns) / grain_ns);
+    context.queued_grains -= @intCast(completed);
+    // Carry the fractional hardware period across a just-drained queue too.
+    // Depth-one producers poll in whole milliseconds: resetting to `now` on
+    // each completion stretches a 256/48000 grain from 5.333 ms to 6 ms and
+    // eventually starves the host output. Rebase only after a full idle grain
+    // so an idle context cannot accumulate an unbounded catch-up allowance.
+    context.queue_updated_ns += completed * grain_ns;
+    if (context.queued_grains == 0 and now -| context.queue_updated_ns >= grain_ns) {
+        context.queue_updated_ns = now;
+    }
+}
+
+fn audioOut2Initialize() callconv(abi.guest) i32 {
+    std.debug.print("[audio out2] initialized\n", .{});
+    return errno.ok;
+}
+
+fn audioOut2ContextResetParam(parameters: ?*AudioOut2ContextParam) callconv(abi.guest) i32 {
+    const output = parameters orelse return audio_out2_error_invalid_parameter;
+    output.* = .{
+        .max_ports = 256,
+        .max_object_ports = 256,
+        .queue_depth = 4,
+        .num_grains = 512,
+        .flags = 1,
+    };
+    return errno.ok;
+}
+
+fn audioOut2ContextQueryMemory(parameters: ?*const AudioOut2ContextParam, memory_size: ?*usize) callconv(abi.guest) i32 {
+    const input = parameters orelse return audio_out2_error_invalid_parameter;
+    const output = memory_size orelse return audio_out2_error_invalid_parameter;
+    const depth = if (input.queue_depth == 0) 4 else input.queue_depth;
+    output.* = 0x10000 + @as(usize, depth) * 0x590;
+    return errno.ok;
+}
+
+fn audioOut2ContextCreate(parameters: ?*const AudioOut2ContextParam, _: ?*anyopaque, _: usize, context: ?*u64) callconv(abi.guest) i32 {
+    const input = parameters orelse return audio_out2_error_invalid_parameter;
+    const output = context orelse return audio_out2_error_invalid_parameter;
+    const queue_depth = if (input.queue_depth == 0) 4 else input.queue_depth;
+    const grains = if (input.num_grains == 0) 512 else input.num_grains;
+    const handle = allocateAudioObject(
+        .context,
+        0,
+        queue_depth,
+        grains,
+    ) orelse return audio_out2_error_port_full;
+    output.* = handle;
+    std.debug.print("[audio out2] context create handle=0x{x} depth={d} grains={d}\n", .{ handle, queue_depth, grains });
+    return errno.ok;
+}
+
+fn audioOut2ContextDestroy(context: u64) callconv(abi.guest) i32 {
+    return if (releaseAudioObject(context, .context)) errno.ok else audio_out2_error_invalid_parameter;
+}
+
+fn audioOut2ContextAdvance(context: u64) callconv(abi.guest) i32 {
+    if (audioObject(context, .context) == null) return audio_out2_error_invalid_parameter;
+    // Advance commits the parameter set; Push submits the grain. Consuming
+    // PCM here as well makes the usual Advance/Push pair pace twice.
+    return errno.ok;
+}
+
+fn audioOut2ContextSetAttributes(
+    context: u64,
+    attributes: ?*const anyopaque,
+    count: u32,
+) callconv(abi.guest) i32 {
+    if (audioObject(context, .context) == null) return audio_out2_error_invalid_parameter;
+    if (count != 0 and attributes == null) return audio_out2_error_invalid_parameter;
+    return errno.ok;
+}
+
+fn audioOut2ContextPush(context: u64, blocking: u32) callconv(abi.guest) i32 {
+    while (true) {
+        audio_object_mutex.lock();
+        if (context == 0 or context > maximum_audio_objects or
+            audio_objects[@intCast(context - 1)].kind != .context)
+        {
+            audio_object_mutex.unlock();
+            return audio_out2_error_invalid_parameter;
+        }
+        const object = &audio_objects[@intCast(context - 1)];
+        updateAudioOut2Queue(object, hostTimestampNs());
+        if (object.queued_grains < object.queue_depth) {
+            object.queued_grains += 1;
+            audio_object_mutex.unlock();
+            _ = submitAudioOut2Context(context);
+            return errno.ok;
+        }
+        audio_object_mutex.unlock();
+        if (blocking == 0) return audio_out2_error_not_ready;
+        _ = kernel_threading.sceKernelUsleep(1000);
+    }
+}
+
+fn audioOut2ContextGetQueueLevel(context: u64, queue_level: ?*u32, available: ?*u32) callconv(abi.guest) i32 {
+    audio_object_mutex.lock();
+    defer audio_object_mutex.unlock();
+    if (context == 0 or context > maximum_audio_objects or
+        audio_objects[@intCast(context - 1)].kind != .context)
+        return audio_out2_error_invalid_parameter;
+    const object = &audio_objects[@intCast(context - 1)];
+    updateAudioOut2Queue(object, hostTimestampNs());
+    if (queue_level) |output| {
+        if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+            output.* = object.queued_grains;
+        }
+    }
+    if (available) |output| {
+        if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), @sizeOf(u32))) {
+            output.* = object.queue_depth - object.queued_grains;
+        }
+    }
+    return errno.ok;
+}
+
+fn audioOut2PortCreate(context: u64, parameters: ?*const AudioOut2PortParam, port: ?*u64) callconv(abi.guest) i32 {
+    const input = parameters orelse return audio_out2_error_invalid_parameter;
+    if (audioObject(context, .context) == null or port == null) return audio_out2_error_invalid_parameter;
+    const handle = allocateAudioObject(.port, context, 0, 0) orelse return audio_out2_error_port_full;
+    audio_object_mutex.lock();
+    audio_objects[@intCast(handle - 1)].data_format = input.data_format;
+    audio_objects[@intCast(handle - 1)].port_type = input.port_type;
+    audio_objects[@intCast(handle - 1)].frequency = if (input.sampling_frequency != 0) input.sampling_frequency else 48_000;
+    audio_object_mutex.unlock();
+    port.?.* = handle;
+    std.debug.print(
+        "[audio out2] port create handle=0x{x} ctx=0x{x} type=0x{x} format=0x{x} freq={d}\n",
+        .{ handle, context, input.port_type, input.data_format, input.sampling_frequency },
+    );
+    return errno.ok;
+}
+
+fn audioOut2PortChannels(data_format: u32) u8 {
+    const encoded: u8 = @truncate(data_format >> 8);
+    if (encoded == 0) return 2;
+    return @min(encoded, 16);
+}
+
+/// The AudioOut2 state is a 16-byte header and six reserved u64s. Yotei
+/// allocates adjacent 64-byte states and copies both 32-byte halves.
+const audio_out2_port_state_bytes: usize = 0x40;
+
+fn audioOut2PortGetState(port: u64, state: ?*[audio_out2_port_state_bytes]u8) callconv(abi.guest) i32 {
+    const output = state orelse return audio_out2_error_invalid_parameter;
+    // A handle this layer never minted still names an output to the title.
+    // Yotei's mixer polls a port it keeps as -1 about a hundred times a
+    // second and reads a failure as "nothing is connected".
+    const data_format = if (audioObject(port, .port)) |object| object.data_format else 0;
+    @memset(output, 0);
+    const channels = if (decodeAudioOut2Format(data_format)) |dec|
+        dec.channels
+    else
+        audioOut2PortChannels(data_format);
+    std.mem.writeInt(u16, output[0x00..0x02], 1, .little);
+    output[0x02] = channels;
+    // Kyty's SceAudioOut2PortState is the same 0x40 record: u16 output,
+    // u8 channels, u8 pad, i16 volume, u16 reroute, u32 flags. Full scale
+    // is 127 here; -1 is a muted port to a title that scales by it.
+    std.mem.writeInt(i16, output[0x04..0x06], 127, .little);
+    return errno.ok;
+}
+
+fn audioOut2PortDestroy(port: u64) callconv(abi.guest) i32 {
+    return if (releaseAudioObject(port, .port)) errno.ok else audio_out2_error_invalid_parameter;
+}
+
+var audio_out2_attribute_pcm_count: u64 = 0;
+
+fn audioOut2PortSetAttributes(port: u64, attributes: ?*const anyopaque, count: u32) callconv(abi.guest) i32 {
+    if (audioObject(port, .port) == null) return audio_out2_error_invalid_parameter;
+    if (count == 0 or attributes == null) return errno.ok;
+    const safe_count = @min(count, 32);
+    const attr_bytes = @as(usize, safe_count) * @sizeOf(AudioOut2AttributeEntry);
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(attributes.?), attr_bytes)) {
+        return errno.ok;
+    }
+    const entries: [*]const AudioOut2AttributeEntry = @ptrCast(@alignCast(attributes.?));
+    for (0..safe_count) |i| {
+        const entry = entries[i];
+        if (entry.attribute_id == 0 and entry.value_address != 0 and entry.value_size >= 8) {
+            if (kernel_memory.isGuestRangeAccessible(entry.value_address, 8)) {
+                const pcm_bytes = @as([*]const u8, @ptrFromInt(entry.value_address))[0..8];
+                const pcm_addr = std.mem.readInt(u64, pcm_bytes, .little);
+                audio_object_mutex.lock();
+                if (port > 0 and port <= maximum_audio_objects) {
+                    audio_objects[@intCast(port - 1)].pcm_address = pcm_addr;
+                    audio_objects[@intCast(port - 1)].pcm_pending = (pcm_addr != 0);
+                }
+                audio_object_mutex.unlock();
+                const n = audio_out2_attribute_pcm_count;
+                audio_out2_attribute_pcm_count += 1;
+                if (n < 8 or n % 500 == 0) {
+                    std.debug.print(
+                        "[audio out2] port set pcm #{d} port=0x{x} pcm=0x{x}\n",
+                        .{ n, port, pcm_addr },
+                    );
+                }
+            }
+        }
+    }
+    return errno.ok;
+}
+
+fn audioOut2UserCreate(_: u32, user: ?*usize) callconv(abi.guest) i32 {
+    const output = user orelse return audio_out2_error_invalid_parameter;
+    output.* = allocateAudioObject(.user, 0, 0, 0) orelse return audio_out2_error_port_full;
+    return errno.ok;
+}
+
+fn audioOut2UserDestroy(user: usize) callconv(abi.guest) i32 {
+    return if (releaseAudioObject(user, .user)) errno.ok else audio_out2_error_invalid_parameter;
+}
+
+const audio_out2_speaker_info_bytes = 0x50;
+
+fn audioOut2GetSpeakerInfo(output: ?*[audio_out2_speaker_info_bytes]u8, _: u32) callconv(abi.guest) i32 {
+    const info = output orelse return audio_out2_error_invalid_parameter;
+    @memset(info, 0);
+    // This is a speaker layout, not a PCM format. In particular +4 is a
+    // speaker mask: putting 48000 here removes both front speakers and makes
+    // the guest route its stereo mix to absent channels.
+    std.mem.writeInt(u32, info[0x04..0x08], 0x03, .little);
+    std.mem.writeInt(i16, info[0x10..0x12], -30, .little);
+    std.mem.writeInt(i16, info[0x14..0x16], 30, .little);
+    return errno.ok;
+}
+
+fn audioOut2Set3DLatency(_: u32, _: u32, _: u32) callconv(abi.guest) i32 {
+    // Latency selection only configures console routing. The host mixer keeps
+    // its own bounded target and does not need a synthetic device here.
+    return errno.ok;
+}
+
+fn audioOut2MasteringInit(_: u32) callconv(abi.guest) i32 {
+    // The title's mastering graph is represented by the host mix rather than a
+    // separate console DSP chain. Its process-wide initialization has no
+    // guest-visible output object.
+    return errno.ok;
+}
+
+fn audioOut2ContextBedWrite(context: u64, _: ?*const anyopaque, _: usize) callconv(abi.guest) i32 {
+    _ = context;
+    return errno.ok;
+}
+
+fn audioOut2LoContextGetQueueLevel(context: u64, queue_level: ?*u32, available: ?*u32) callconv(abi.guest) i32 {
+    return audioOut2ContextGetQueueLevel(context, queue_level, available);
+}
+
+fn audioOut2GetSystemState(state: ?*anyopaque) callconv(abi.guest) i32 {
+    const output = state orelse return audio_out2_error_invalid_parameter;
+    if (kernel_memory.isGuestRangeAccessible(@intFromPtr(output), 0x40)) {
+        @memset(@as([*]u8, @ptrCast(output))[0..0x40], 0);
+    }
+    return errno.ok;
+}
+
+const audio_out2_exports = [_]symbols.Export{
+    .{ .name = "sceAudioOut2Initialize", .function = trace.wrap("sceAudioOut2Initialize", &audioOut2Initialize), .expect_id = "g2tViFIohHE" },
+    .{ .name = "sceAudioOut2ContextResetParam", .function = trace.wrap("sceAudioOut2ContextResetParam", &audioOut2ContextResetParam), .expect_id = "t5YrizufpQc" },
+    .{ .name = "sceAudioOut2ContextQueryMemory", .function = trace.wrap("sceAudioOut2ContextQueryMemory", &audioOut2ContextQueryMemory), .expect_id = "pDmme7Bgm6E" },
+    .{ .name = "sceAudioOut2ContextCreate", .function = trace.wrap("sceAudioOut2ContextCreate", &audioOut2ContextCreate), .expect_id = "0x6o1VVAYSY" },
+    .{ .name = "sceAudioOut2ContextDestroy", .function = trace.wrap("sceAudioOut2ContextDestroy", &audioOut2ContextDestroy), .expect_id = "on6ZH7Abo10" },
+    .{ .name = "sceAudioOut2ContextSetAttributes", .function = trace.wrap("sceAudioOut2ContextSetAttributes", &audioOut2ContextSetAttributes), .expect_id = "4dq2rblWlg0" },
+    .{ .name = "sceAudioOut2ContextAdvance", .function = trace.wrap("sceAudioOut2ContextAdvance", &audioOut2ContextAdvance), .expect_id = "PE2zHMqLSHs" },
+    .{ .name = "sceAudioOut2ContextPush", .function = trace.wrap("sceAudioOut2ContextPush", &audioOut2ContextPush), .expect_id = "aII9h5nli9U" },
+    .{ .name = "sceAudioOut2ContextGetQueueLevel", .function = trace.wrap("sceAudioOut2ContextGetQueueLevel", &audioOut2ContextGetQueueLevel), .expect_id = "R7d0F1g2qsU" },
+    .{ .name = "sceAudioOut2LoContextGetQueueLevel", .function = trace.wrap("sceAudioOut2LoContextGetQueueLevel", &audioOut2LoContextGetQueueLevel), .expect_id = "Q8DZkKQ-SYc" },
+    .{ .name = "sceAudioOut2ContextBedWrite", .function = trace.wrap("sceAudioOut2ContextBedWrite", &audioOut2ContextBedWrite), .expect_id = "DxGyV8dtOR8" },
+    .{ .name = "sceAudioOut2PortCreate", .function = trace.wrap("sceAudioOut2PortCreate", &audioOut2PortCreate), .expect_id = "JK2wamZPzwM" },
+    .{ .name = "sceAudioOut2PortGetState", .function = trace.wrap("sceAudioOut2PortGetState", &audioOut2PortGetState), .expect_id = "gatEUKG+Ea4" },
+    .{ .name = "sceAudioOut2PortDestroy", .function = trace.wrap("sceAudioOut2PortDestroy", &audioOut2PortDestroy), .expect_id = "cd+Rtw+D1x8" },
+    .{ .name = "sceAudioOut2PortSetAttributes", .function = trace.wrap("sceAudioOut2PortSetAttributes", &audioOut2PortSetAttributes), .expect_id = "8XTArSPyWHk" },
+    .{ .name = "sceAudioOut2UserCreate", .function = trace.wrap("sceAudioOut2UserCreate", &audioOut2UserCreate), .expect_id = "xywYcRB7nbQ" },
+    .{ .name = "sceAudioOut2UserDestroy", .function = trace.wrap("sceAudioOut2UserDestroy", &audioOut2UserDestroy), .expect_id = "IaZXJ9M79uo" },
+    .{ .name = "sceAudioOut2GetSpeakerInfo", .function = trace.wrap("sceAudioOut2GetSpeakerInfo", &audioOut2GetSpeakerInfo), .expect_id = "DImz2Ft9E2g" },
+    .{ .name = "sceAudioOut2GetSystemState", .function = trace.wrap("sceAudioOut2GetSystemState", &audioOut2GetSystemState), .expect_id = "bkBN+CMLwRc" },
+    .{ .name = "sceAudioOut2Set3DLatency", .function = trace.wrap("sceAudioOut2Set3DLatency", &audioOut2Set3DLatency), .expect_id = "TViD1EZXkNI" },
+    .{ .name = "sceAudioOut2MasteringInit", .function = trace.wrap("sceAudioOut2MasteringInit", &audioOut2MasteringInit), .expect_id = "XHl38ZNknbs" },
+};
+
+// libSceNgs2 ---------------------------------------------------------------
+
+const Ngs2RenderBuffer = extern struct {
+    address: u64,
+    size: u64,
+    waveform_type: u32,
+    channels: u32,
+};
+
+const Ngs2WaveformFormat = ngs2_waveform.Format;
+const Ngs2WaveformBlock = ngs2_waveform.Block;
+const Ngs2WaveformInfo = ngs2_waveform.Info;
+
+var next_ngs2_handle = std.atomic.Value(u64).init(0x4e47_0001);
+var ngs2_render_calls = std.atomic.Value(u64).init(0);
+var ngs2_control_logs = std.atomic.Value(u32).init(0);
+var ngs2_state_logs = std.atomic.Value(u32).init(0);
+var ngs2_waveform_logs = std.atomic.Value(u32).init(0);
+var ngs2_command_logs = std.atomic.Value(u32).init(0);
+var ngs2_format_logs = std.atomic.Value(u32).init(0);
+var ngs2_sampler_detail_logs: [2]u32 = .{ 0, 0 }; // protected by ngs2_mutex
+
+const maximum_ngs2_systems = 8;
+const maximum_ngs2_racks = 64;
+const maximum_ngs2_voices = 1024;
+const maximum_ngs2_ports = 256;
+
+const ngs2_error_invalid_voice: i32 = @bitCast(@as(u32, 0x804a0300));
+const ngs2_error_invalid_port: i32 = @bitCast(@as(u32, 0x804a0304));
+const ngs2_error_invalid_patch: i32 = @bitCast(@as(u32, 0x804a0305));
+const ngs2_error_invalid_matrix: i32 = @bitCast(@as(u32, 0x804a0700));
+const ngs2_error_invalid_query_output: i32 = @bitCast(@as(u32, 0x804a8010));
+const ngs2_error_invalid_query_size: i32 = @bitCast(@as(u32, 0x804a8011));
+const ngs2_voice_info_channels: u32 = 0x4001;
+
+const Ngs2VoiceState = enum(u8) {
+    empty,
+    playing,
+    paused,
+    stopped,
+};
+
+const Ngs2VoiceEvent = enum(u8) {
+    none,
+    play,
+    stop,
+    stop_immediate,
+    kill,
+    pause,
+    resume_playback,
+};
+
+/// SceNgs2ContextBufferInfo. Systems and racks created from a caller's
+/// buffer return it from their destroy call so the caller can free it.
+const Ngs2BufferInfo = extern struct {
+    host_buffer: u64 = 0,
+    host_buffer_size: u64 = 0,
+    reserved: [5]u64 = @splat(0),
+    user_data: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Ngs2BufferInfo) == 64);
+}
+
+const Ngs2System = struct {
+    active: bool = false,
+    handle: u64 = 0,
+    grain: u32 = 256,
+    sample_rate: u32 = 48_000,
+    buffer: Ngs2BufferInfo = .{},
+    render_count: u64 = 0,
+};
+
+const Ngs2Rack = struct {
+    active: bool = false,
+    handle: u64 = 0,
+    system: u64 = 0,
+    rack_id: u32 = 0,
+    buffer: Ngs2BufferInfo = .{},
+    options: Ngs2RackOptions = .{},
+};
+
+const Ngs2RackOptions = struct {
+    name: [64]u8 = @splat(0),
+    max_grain: u32 = 256,
+    max_voices: u32 = 64,
+    max_matrices: u32 = 1,
+    max_ports: u32 = 8,
+};
+
+// The 216-byte common prefix is also used by the 232-byte PS5 query.
+const Ngs2RackInfo = extern struct {
+    name: [64]u8 = @splat(0),
+    handle: u64 = 0,
+    buffer: Ngs2BufferInfo = .{},
+    system: u64 = 0,
+    type: u32 = 0,
+    rack_id: u32 = 0,
+    uid: u32 = 0,
+    min_grain: u32 = 64,
+    max_grain: u32 = 0,
+    max_voices: u32 = 0,
+    max_channel_works: u32 = 0,
+    max_inputs: u32 = 0,
+    max_matrices: u32 = 0,
+    max_ports: u32 = 0,
+    state_flags: u32 = 1,
+    process_ratio: f32 = 0,
+    processed_tick: u64 = 0,
+    render_count: u64 = 0,
+    active_voices: u32 = 0,
+    active_channel_works: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Ngs2RackInfo) == 216);
+    std.debug.assert(@offsetOf(Ngs2RackInfo, "max_voices") == 0xa4);
+}
+
+const Ngs2Voice = struct {
+    active: bool = false,
+    handle: u64 = 0,
+    rack: u64 = 0,
+    voice_id: u32 = 0,
+    state: Ngs2VoiceState = .empty,
+    event: Ngs2VoiceEvent = .none,
+    source_address: u64 = 0,
+    source_rate: u32 = 48_000,
+    source_channels: u8 = 0,
+    samples: []f32 = &.{},
+    waveform_cache_index: ?u8 = null,
+    position: f64 = 0,
+    loop_start: ?usize = null,
+    loop_end: usize = 0,
+    gain: f32 = 1,
+    pcm: ?ngs2_pcm.Stream = null,
+    atrac9: ?*ngs2_atrac9.Stream = null,
+    ports: []Ngs2VoicePortInfo = &.{},
+};
+
+/// Query ABI shared by the port controls. Keep every port independent; the
+/// current direct PCM mixer consumes port zero's volume, while graph routing,
+/// matrix mixing and delay processing remain separate renderer work.
+const Ngs2VoicePortInfo = extern struct {
+    matrix_id: i32 = -1,
+    volume: f32 = 1,
+    num_delay_samples: u32 = 0,
+    dest_input_id: u32 = 0,
+    dest_handle: u64 = 0,
+};
+
+/// SceNgs2VoiceQueryInfo's CHANNELS payload. An unconfigured voice has no
+/// channels; configured voices report their source/mixer width, not the
+/// host's stereo output format.
+const Ngs2VoiceChannelsInfo = extern struct {
+    num_channels: u32,
+    reserved: u32 = 0,
+};
+
+comptime {
+    std.debug.assert(@sizeOf(Ngs2VoicePortInfo) == 24);
+    std.debug.assert(@offsetOf(Ngs2VoicePortInfo, "dest_handle") == 16);
+    std.debug.assert(@sizeOf(Ngs2VoiceChannelsInfo) == 8);
+}
+
+const Ngs2VoiceParamHeader = extern struct {
+    size: u16,
+    next: i16,
+    id: u32,
+};
+
+const Ngs2VoiceEventParam = extern struct {
+    header: Ngs2VoiceParamHeader,
+    event_id: u32,
+};
+
+const Ngs2VoiceWaveformParam = extern struct {
+    header: Ngs2VoiceParamHeader,
+    data_address: u64,
+};
+
+const maximum_ngs2_waveform_bytes = 8 * 1024 * 1024;
+
+const Ngs2DecodedWaveform = struct {
+    samples: []f32,
+    sample_rate: u32,
+    channels: u8,
+    loop_start: ?usize = null,
+    loop_end: usize,
+};
+
+const maximum_ngs2_cached_waveforms = 64;
+const maximum_ngs2_waveform_cache_bytes = 128 * 1024 * 1024;
+
+const Ngs2CachedWaveform = struct {
+    active: bool = false,
+    address: u64 = 0,
+    samples: []f32 = &.{},
+    sample_rate: u32 = 48_000,
+    channels: u8 = 1,
+    loop_start: ?usize = null,
+    loop_end: usize = 0,
+    references: u16 = 0,
+    last_used_sequence: u64 = 0,
+};
+
+var ngs2_mutex = Lock{};
+var ngs2_systems = [_]Ngs2System{.{}} ** maximum_ngs2_systems;
+var ngs2_racks = [_]Ngs2Rack{.{}} ** maximum_ngs2_racks;
+// Voice limits belong to each rack. A full sampler rack must not exhaust
+// the slots needed by the system's mastering/submixer racks.
+var ngs2_voices: std.ArrayList(Ngs2Voice) = .empty;
+var ngs2_waveform_cache = [_]Ngs2CachedWaveform{.{}} ** maximum_ngs2_cached_waveforms;
+var ngs2_waveform_cache_bytes: usize = 0;
+var ngs2_waveform_cache_sequence: u64 = 0;
+
+fn ngs2Handle() u64 {
+    return next_ngs2_handle.fetchAdd(1, .monotonic);
+}
+
+const Ngs2SystemOptions = struct { grain: u32 = 256, sample_rate: u32 = 48_000 };
+const Ngs2OptionError = error{ Fault, Invalid };
+
+fn ngs2ReadSystemOptions(options: u64) Ngs2OptionError!Ngs2SystemOptions {
+    var result = Ngs2SystemOptions{};
+    if (options == 0) return result;
+    if (!kernel_memory.isGuestRangeAccessible(options, 144)) return error.Fault;
+    const bytes = @as([*]const u8, @ptrFromInt(options))[0..144];
+    if (std.mem.readInt(u64, bytes[0..8], .little) < 144) return error.Invalid;
+    result.grain = std.mem.readInt(u32, bytes[112..116], .little);
+    result.sample_rate = std.mem.readInt(u32, bytes[116..120], .little);
+    if (result.grain == 0 or result.grain > 4096 or result.sample_rate < 8000 or result.sample_rate > 192000) {
+        return error.Invalid;
+    }
+    return result;
+}
+
+fn ngs2OptionError(err: Ngs2OptionError) i32 {
+    return if (err == error.Fault) errno.KernelError.efault.raw() else errno.KernelError.einval.raw();
+}
+
+fn ngs2CreateSystem(options: u64, buffer: Ngs2BufferInfo, output: ?*u64) i32 {
+    const parsed = ngs2ReadSystemOptions(options) catch |err| return ngs2OptionError(err);
+    const destination = output orelse return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
+        return errno.KernelError.efault.raw();
+    }
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    for (&ngs2_systems) |*system| {
+        if (system.active) continue;
+        const handle = ngs2Handle();
+        system.* = .{ .active = true, .handle = handle, .grain = parsed.grain, .sample_rate = parsed.sample_rate, .buffer = buffer };
+        destination.* = handle;
+        return errno.ok;
+    }
+    return errno.KernelError.enomem.raw();
+}
+
+fn ngs2SystemCreateWithAllocator(options: u64, _: u64, output: ?*u64) callconv(abi.guest) i32 {
+    return ngs2CreateSystem(options, .{}, output);
+}
+
+/// State lives on the host, so the caller's buffer only has to exist. The
+/// sizes keep the SDK's shape — a fixed system, a rack growing with its
+/// voice count — so titles that budget audio memory get familiar numbers.
+const ngs2_system_buffer_bytes: u64 = 64 * 1024;
+
+fn ngs2ReadRackOptions(options: u64) Ngs2OptionError!Ngs2RackOptions {
+    var result = Ngs2RackOptions{};
+    if (options != 0) {
+        if (!kernel_memory.isGuestRangeAccessible(options, 36)) return error.Fault;
+        const ptr: [*]const u8 = @ptrFromInt(options);
+        const size = std.mem.readInt(u64, ptr[0..8], .little);
+        if (size < 36) return error.Invalid;
+        // Full SDK options have name[64]. Keep the old compact layout for
+        // callers that explicitly declare its shorter size.
+        const name_size: usize = if (size >= 176) 64 else 16;
+        const prefix_size: usize = if (size >= 176) 104 else 36;
+        if (!kernel_memory.isGuestRangeAccessible(options, prefix_size)) return error.Fault;
+        @memcpy(result.name[0..name_size], ptr[8 .. 8 + name_size]);
+        const grain = std.mem.readInt(u32, ptr[12 + name_size ..][0..4], .little);
+        const voices = std.mem.readInt(u32, ptr[16 + name_size ..][0..4], .little);
+        if (grain > 4096 or voices > maximum_ngs2_voices) return error.Invalid;
+        if (grain != 0) result.max_grain = grain;
+        if (voices != 0) result.max_voices = voices;
+        if (size >= 176) {
+            result.max_matrices = std.mem.readInt(u32, ptr[88..92], .little);
+            result.max_ports = std.mem.readInt(u32, ptr[92..96], .little);
+            if (result.max_ports > maximum_ngs2_ports) return error.Invalid;
+        }
+    }
+    return result;
+}
+
+fn ngs2RackBufferBytes(options: u64) Ngs2OptionError!u64 {
+    return 16 * 1024 + @as(u64, (try ngs2ReadRackOptions(options)).max_voices) * 1024;
+}
+
+fn ngs2WriteBufferSize(info_address: u64, size: u64) i32 {
+    if (info_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(Ngs2BufferInfo))) return errno.KernelError.efault.raw();
+    const info: *align(1) Ngs2BufferInfo = @ptrFromInt(info_address);
+    info.* = .{ .host_buffer_size = size };
+    return errno.ok;
+}
+
+/// Reads the caller's buffer description and checks it covers `required`.
+fn ngs2ReadBuffer(info_address: u64, required: u64) Ngs2OptionError!Ngs2BufferInfo {
+    if (info_address == 0) return error.Invalid;
+    if (!kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(Ngs2BufferInfo))) return error.Fault;
+    const info = @as(*align(1) const Ngs2BufferInfo, @ptrFromInt(info_address)).*;
+    if (info.host_buffer == 0 or info.host_buffer_size < required) return error.Invalid;
+    if (!kernel_memory.isGuestRangeAccessible(info.host_buffer, required)) return error.Fault;
+    return info;
+}
+
+fn ngs2SystemQueryBufferSize(options: u64, info_address: u64) callconv(abi.guest) i32 {
+    _ = ngs2ReadSystemOptions(options) catch |err| return ngs2OptionError(err);
+    return ngs2WriteBufferSize(info_address, ngs2_system_buffer_bytes);
+}
+
+fn ngs2SystemCreate(options: u64, info_address: u64, output: ?*u64) callconv(abi.guest) i32 {
+    const buffer = ngs2ReadBuffer(info_address, ngs2_system_buffer_bytes) catch |err| return ngs2OptionError(err);
+    return ngs2CreateSystem(options, buffer, output);
+}
+
+fn ngs2RackQueryBufferSize(_: u32, options: u64, info_address: u64) callconv(abi.guest) i32 {
+    const size = ngs2RackBufferBytes(options) catch |err| return ngs2OptionError(err);
+    return ngs2WriteBufferSize(info_address, size);
+}
+
+fn ngs2RackCreate(system: u64, rack_id: u32, options: u64, info_address: u64, output: ?*u64) callconv(abi.guest) i32 {
+    const size = ngs2RackBufferBytes(options) catch |err| return ngs2OptionError(err);
+    const buffer = ngs2ReadBuffer(info_address, size) catch |err| return ngs2OptionError(err);
+    return ngs2CreateRack(system, rack_id, options, buffer, output);
+}
+
+/// Hands back the buffer a system or rack was created from; allocator-backed
+/// objects report an empty one.
+fn ngs2ReturnBuffer(info_address: u64, buffer: Ngs2BufferInfo) i32 {
+    if (info_address == 0) return errno.ok;
+    if (!kernel_memory.isGuestRangeAccessible(info_address, @sizeOf(Ngs2BufferInfo))) return errno.KernelError.efault.raw();
+    const info: *align(1) Ngs2BufferInfo = @ptrFromInt(info_address);
+    info.* = buffer;
+    return errno.ok;
+}
+
+fn ngs2RackCreateWithAllocator(
+    system: u64,
+    rack_id: u32,
+    options: u64,
+    _: u64,
+    output: ?*u64,
+) callconv(abi.guest) i32 {
+    return ngs2CreateRack(system, rack_id, options, .{}, output);
+}
+
+fn ngs2CreateRack(system: u64, rack_id: u32, options: u64, buffer: Ngs2BufferInfo, output: ?*u64) i32 {
+    var parsed = ngs2ReadRackOptions(options) catch |err| return ngs2OptionError(err);
+    if (options == 0 and rack_id == 0x3000) {
+        parsed.max_ports = 0;
+        parsed.max_matrices = 0;
+    }
+    if (system == 0) return errno.KernelError.einval.raw();
+    const destination = output orelse return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
+        return errno.KernelError.efault.raw();
+    }
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    if (ngs2FindSystem(system) == null) return errno.KernelError.einval.raw();
+    for (&ngs2_racks) |*rack| {
+        if (rack.active) continue;
+        const handle = ngs2Handle();
+        rack.* = .{ .active = true, .handle = handle, .system = system, .rack_id = rack_id, .buffer = buffer, .options = parsed };
+        destination.* = handle;
+        return errno.ok;
+    }
+    return errno.KernelError.enomem.raw();
+}
+
+fn ngs2RackGetInfo(handle: u64, output: u64, size: usize) callconv(abi.guest) i32 {
+    if (output == 0) return ngs2_error_invalid_output;
+    if (size != @sizeOf(Ngs2RackInfo) and size != 232) return @bitCast(@as(u32, 0x804a8011));
+    if (!kernel_memory.isGuestRangeAccessible(output, size)) return errno.KernelError.efault.raw();
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const rack = ngs2FindRack(handle) orelse return @bitCast(@as(u32, 0x804a0261));
+    const system = ngs2FindSystem(rack.system) orelse return errno.KernelError.einval.raw();
+    var info = Ngs2RackInfo{
+        .name = rack.options.name,
+        .handle = rack.handle,
+        .buffer = rack.buffer,
+        .system = rack.system,
+        .type = rack.rack_id >> 12,
+        .rack_id = rack.rack_id,
+        .uid = @truncate(rack.handle),
+        .max_grain = rack.options.max_grain,
+        .max_voices = rack.options.max_voices,
+        .max_matrices = rack.options.max_matrices,
+        .max_ports = rack.options.max_ports,
+        .render_count = system.render_count,
+    };
+    for (ngs2_voices.items) |*voice| {
+        if (voice.active and voice.rack == handle and voice.state != .empty) {
+            info.active_voices += 1;
+            info.active_channel_works += voice.source_channels;
+        }
+    }
+    if (kernel_memory.attachedAddressSpace()) |space| space.notifyGuestWrite(output, size);
+    const bytes = @as([*]u8, @ptrFromInt(output))[0..size];
+    @memset(bytes, 0);
+    @memcpy(bytes[0..@sizeOf(Ngs2RackInfo)], std.mem.asBytes(&info));
+    return errno.ok;
+}
+
+fn ngs2RackGetVoiceHandle(rack: u64, voice_id: u32, output: ?*u64) callconv(abi.guest) i32 {
+    if (rack == 0) return errno.KernelError.einval.raw();
+    const destination = output orelse return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(destination), @sizeOf(u64))) {
+        return errno.KernelError.efault.raw();
+    }
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const owner = ngs2FindRack(rack) orelse return errno.KernelError.einval.raw();
+    if (voice_id >= owner.options.max_voices) return errno.KernelError.einval.raw();
+    for (ngs2_voices.items) |*voice| {
+        if (voice.active and voice.rack == rack and voice.voice_id == voice_id) {
+            destination.* = voice.handle;
+            return errno.ok;
+        }
+    }
+    const allocator = std.heap.page_allocator;
+    const ports = allocator.alloc(Ngs2VoicePortInfo, owner.options.max_ports) catch return errno.KernelError.enomem.raw();
+    @memset(ports, .{});
+    const slot: *Ngs2Voice = slot: {
+        for (ngs2_voices.items) |*voice| if (!voice.active) break :slot voice;
+        const added = ngs2_voices.addOne(allocator) catch {
+            allocator.free(ports);
+            return errno.KernelError.enomem.raw();
+        };
+        break :slot added;
+    };
+    const handle = ngs2Handle();
+    slot.* = .{ .active = true, .handle = handle, .rack = rack, .voice_id = voice_id, .ports = ports };
+    destination.* = handle;
+    return errno.ok;
+}
+
+fn ngs2FindSystem(handle: u64) ?*Ngs2System {
+    for (&ngs2_systems) |*system| if (system.active and system.handle == handle) return system;
+    return null;
+}
+
+fn ngs2FindRack(handle: u64) ?*Ngs2Rack {
+    for (&ngs2_racks) |*rack| if (rack.active and rack.handle == handle) return rack;
+    return null;
+}
+
+fn ngs2FindVoice(handle: u64) ?*Ngs2Voice {
+    for (ngs2_voices.items) |*voice| if (voice.active and voice.handle == handle) return voice;
+    return null;
+}
+
+/// Validates the system handle for a guest-requested exclusive section.
+///
+/// Every NGS2 entry point already serializes against `ngs2_mutex`, so holding
+/// that host mutex until the guest calls SystemUnlock would deadlock the first
+/// nested NGS2 call. The emulator therefore acknowledges the section without
+/// changing locking behavior; each call inside it remains individually
+/// serialized.
+fn ngs2SystemLock(handle: u64) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    return if (ngs2FindSystem(handle) != null) errno.ok else errno.KernelError.einval.raw();
+}
+
+fn ngs2SystemUnlock(handle: u64) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    return if (ngs2FindSystem(handle) != null) errno.ok else errno.KernelError.einval.raw();
+}
+
+fn ngs2FreeVoiceWaveform(voice: *Ngs2Voice) void {
+    if (voice.waveform_cache_index) |raw_index| {
+        const index: usize = raw_index;
+        if (index < ngs2_waveform_cache.len) {
+            const cached = &ngs2_waveform_cache[index];
+            if (cached.active and cached.references != 0) cached.references -= 1;
+        }
+    } else if (voice.samples.len != 0) {
+        std.heap.page_allocator.free(voice.samples);
+    }
+    voice.samples = &.{};
+    voice.waveform_cache_index = null;
+    voice.source_address = 0;
+    voice.position = 0;
+    voice.loop_start = null;
+    voice.loop_end = 0;
+}
+
+fn ngs2EvictCachedWaveform(index: usize) void {
+    const cached = &ngs2_waveform_cache[index];
+    if (!cached.active or cached.references != 0) return;
+    const bytes = cached.samples.len * @sizeOf(f32);
+    if (cached.samples.len != 0) std.heap.page_allocator.free(cached.samples);
+    ngs2_waveform_cache_bytes -|= bytes;
+    cached.* = .{};
+}
+
+fn ngs2OldestUnusedWaveform() ?usize {
+    var selected: ?usize = null;
+    var oldest: u64 = std.math.maxInt(u64);
+    for (&ngs2_waveform_cache, 0..) |*cached, index| {
+        if (!cached.active) return index;
+        if (cached.references != 0 or cached.last_used_sequence >= oldest) continue;
+        selected = index;
+        oldest = cached.last_used_sequence;
+    }
+    return selected;
+}
+
+fn ngs2OldestEvictableWaveform() ?usize {
+    var selected: ?usize = null;
+    var oldest: u64 = std.math.maxInt(u64);
+    for (&ngs2_waveform_cache, 0..) |*cached, index| {
+        if (!cached.active or cached.references != 0 or cached.last_used_sequence >= oldest) continue;
+        selected = index;
+        oldest = cached.last_used_sequence;
+    }
+    return selected;
+}
+
+fn ngs2BindCachedWaveform(voice: *Ngs2Voice, index: usize) void {
+    const cached = &ngs2_waveform_cache[index];
+    std.debug.assert(cached.active);
+    cached.references +|= 1;
+    ngs2_waveform_cache_sequence +%= 1;
+    cached.last_used_sequence = ngs2_waveform_cache_sequence;
+    voice.source_address = cached.address;
+    voice.source_rate = cached.sample_rate;
+    voice.source_channels = cached.channels;
+    voice.samples = cached.samples;
+    voice.waveform_cache_index = @intCast(index);
+    voice.position = 0;
+    voice.loop_start = cached.loop_start;
+    voice.loop_end = cached.loop_end;
+    voice.state = .playing;
+}
+
+fn ngs2FindCachedWaveform(address: u64) ?usize {
+    for (&ngs2_waveform_cache, 0..) |*cached, index| {
+        if (cached.active and cached.address == address) return index;
+    }
+    return null;
+}
+
+/// Takes ownership of `decoded.samples` on success.
+fn ngs2CacheWaveform(address: u64, decoded: Ngs2DecodedWaveform) ?usize {
+    const bytes = decoded.samples.len * @sizeOf(f32);
+    if (bytes > maximum_ngs2_waveform_cache_bytes) return null;
+    while (ngs2_waveform_cache_bytes +| bytes > maximum_ngs2_waveform_cache_bytes) {
+        const victim = ngs2OldestEvictableWaveform() orelse return null;
+        ngs2EvictCachedWaveform(victim);
+    }
+    const slot = ngs2OldestUnusedWaveform() orelse return null;
+    if (ngs2_waveform_cache[slot].active) ngs2EvictCachedWaveform(slot);
+    ngs2_waveform_cache_sequence +%= 1;
+    ngs2_waveform_cache[slot] = .{
+        .active = true,
+        .address = address,
+        .samples = decoded.samples,
+        .sample_rate = decoded.sample_rate,
+        .channels = decoded.channels,
+        .loop_start = decoded.loop_start,
+        .loop_end = decoded.loop_end,
+        .last_used_sequence = ngs2_waveform_cache_sequence,
+    };
+    ngs2_waveform_cache_bytes += bytes;
+    return slot;
+}
+
+fn ngs2FreeAtrac9(voice: *Ngs2Voice) void {
+    if (voice.atrac9) |stream| {
+        stream.deinit(std.heap.page_allocator);
+        std.heap.page_allocator.destroy(stream);
+        voice.atrac9 = null;
+    }
+}
+
+fn ngs2ResetVoice(voice: *Ngs2Voice) void {
+    if (voice.active) {
+        for (ngs2_voices.items) |*source| {
+            if (!source.active) continue;
+            for (source.ports) |*port| {
+                if (port.dest_handle != voice.handle) continue;
+                port.dest_handle = 0;
+                port.dest_input_id = 0;
+            }
+        }
+    }
+    ngs2FreeVoiceWaveform(voice);
+    ngs2FreeAtrac9(voice);
+    if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
+    std.heap.page_allocator.free(voice.ports);
+    voice.* = .{};
+}
+
+fn ngs2RackDestroy(handle: u64, info_address: u64) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const rack = ngs2FindRack(handle) orelse return errno.KernelError.einval.raw();
+    const buffer = rack.buffer;
+    for (ngs2_voices.items) |*voice| {
+        if (voice.active and voice.rack == handle) ngs2ResetVoice(voice);
+    }
+    rack.* = .{};
+    return ngs2ReturnBuffer(info_address, buffer);
+}
+
+fn ngs2SystemDestroy(handle: u64, info_address: u64) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const system = ngs2FindSystem(handle) orelse return errno.KernelError.einval.raw();
+    const buffer = system.buffer;
+    for (&ngs2_racks) |*rack| {
+        if (!rack.active or rack.system != handle) continue;
+        for (ngs2_voices.items) |*voice| {
+            if (voice.active and voice.rack == rack.handle) ngs2ResetVoice(voice);
+        }
+        rack.* = .{};
+    }
+    system.* = .{};
+    return ngs2ReturnBuffer(info_address, buffer);
+}
+
+fn ngs2Event(event_id: u32) ?Ngs2VoiceEvent {
+    return switch (event_id) {
+        0x0001 => .play,
+        0x0002 => .stop,
+        0x0004 => .stop_immediate,
+        0x0008 => .kill,
+        0x0010 => .pause,
+        0x0020 => .resume_playback,
+        else => null,
+    };
+}
+
+fn ngs2NextParam(address: u64, offset: i16) ?u64 {
+    const wide_offset: i32 = offset;
+    return if (wide_offset > 0)
+        std.math.add(u64, address, @intCast(wide_offset)) catch null
+    else
+        std.math.sub(u64, address, @intCast(-wide_offset)) catch null;
+}
+
+fn ngs2DecodeVag(address: u64) ?Ngs2DecodedWaveform {
+    const header_size = 0x30;
+    if (!kernel_memory.isGuestRangeAccessible(address, header_size)) return null;
+    const pointer: [*]const u8 = @ptrFromInt(address);
+    const header = pointer[0..header_size];
+    if (!std.mem.eql(u8, header[0..4], "VAGp")) return null;
+
+    const declared_size: usize = std.mem.readInt(u32, header[0x0c..0x10], .big);
+    const sample_rate_raw = std.mem.readInt(u32, header[0x10..0x14], .big);
+    const frame_bytes = declared_size - (declared_size % 16);
+    if (frame_bytes == 0 or frame_bytes > maximum_ngs2_waveform_bytes) return null;
+    const total_bytes = std.math.add(usize, header_size, frame_bytes) catch return null;
+    if (!kernel_memory.isGuestRangeAccessible(address, total_bytes)) return null;
+    const sample_count = std.math.mul(usize, frame_bytes / 16, 28) catch return null;
+    if (sample_count > 4 * 1024 * 1024) return null;
+    const samples = std.heap.page_allocator.alloc(f32, sample_count) catch return null;
+
+    const coefficients0 = [_]i32{ 0, 60, 115, 98, 122 };
+    const coefficients1 = [_]i32{ 0, 0, -52, -55, -60 };
+    const frames = pointer[header_size..total_bytes];
+    var history1: i32 = 0;
+    var history2: i32 = 0;
+    var output_index: usize = 0;
+    var loop_start: ?usize = null;
+    var loop_end: usize = 0;
+    var ended = false;
+    var frame: usize = 0;
+    while (frame < frame_bytes / 16 and !ended) : (frame += 1) {
+        const offset = frame * 16;
+        const shift: u5 = @intCast(@min(frames[offset] & 0x0f, 12));
+        const filter: usize = @min(frames[offset] >> 4, coefficients0.len - 1);
+        const flags = frames[offset + 1];
+        if (flags == 0x03) loop_start = output_index;
+        for (0..14) |byte_index| {
+            const sample_byte = frames[offset + 2 + byte_index];
+            for (0..2) |nibble_index| {
+                const raw: u8 = if (nibble_index == 0) sample_byte & 0x0f else sample_byte >> 4;
+                const signed: i32 = if (raw >= 8) @as(i32, raw) - 16 else raw;
+                const residual = (signed << 12) >> shift;
+                const predicted = (history1 * coefficients0[filter] + history2 * coefficients1[filter]) >> 6;
+                const decoded = std.math.clamp(residual + predicted, std.math.minInt(i16), std.math.maxInt(i16));
+                samples[output_index] = @as(f32, @floatFromInt(decoded)) / 32768.0;
+                output_index += 1;
+                history2 = history1;
+                history1 = decoded;
+            }
+        }
+        if (flags == 0x06) {
+            loop_end = output_index;
+        } else if (flags == 0x01 or flags == 0x07) {
+            ended = true;
+        }
+    }
+    if (output_index == 0) {
+        std.heap.page_allocator.free(samples);
+        return null;
+    }
+    if (loop_start != null and loop_end <= loop_start.?) loop_end = output_index;
+    const trimmed = std.heap.page_allocator.realloc(samples, output_index) catch samples;
+    return .{
+        .samples = trimmed,
+        .sample_rate = if (sample_rate_raw == 0) 48_000 else sample_rate_raw,
+        .channels = 1,
+        .loop_start = loop_start,
+        .loop_end = if (loop_end != 0) loop_end else output_index,
+    };
+}
+
+fn ngs2DecodeWave(address: u64) ?Ngs2DecodedWaveform {
+    if (!kernel_memory.isGuestRangeAccessible(address, 12)) return null;
+    const pointer: [*]const u8 = @ptrFromInt(address);
+    const header = pointer[0..12];
+    if (!std.mem.eql(u8, header[0..4], "RIFF") or !std.mem.eql(u8, header[8..12], "WAVE")) return null;
+    const riff_payload: usize = std.mem.readInt(u32, header[4..8], .little);
+    const riff_bytes = std.math.add(usize, riff_payload, 8) catch return null;
+    if (riff_bytes < 12 or riff_bytes > maximum_ngs2_waveform_bytes or
+        !kernel_memory.isGuestRangeAccessible(address, riff_bytes)) return null;
+    const bytes = pointer[0..riff_bytes];
+
+    var format_tag: u16 = 0;
+    var channels: u16 = 0;
+    var sample_rate: u32 = 0;
+    var block_align: u16 = 0;
+    var bits_per_sample: u16 = 0;
+    var data_offset: usize = 0;
+    var data_size: usize = 0;
+    var loop_start: ?usize = null;
+    var loop_end: usize = 0;
+    var offset: usize = 12;
+    while (offset + 8 <= bytes.len) {
+        const chunk_size: usize = std.mem.readInt(u32, bytes[offset + 4 ..][0..4], .little);
+        const chunk_data = offset + 8;
+        if (chunk_size > bytes.len - chunk_data) return null;
+        if (std.mem.eql(u8, bytes[offset..][0..4], "fmt ") and chunk_size >= 16) {
+            format_tag = std.mem.readInt(u16, bytes[chunk_data..][0..2], .little);
+            channels = std.mem.readInt(u16, bytes[chunk_data + 2 ..][0..2], .little);
+            sample_rate = std.mem.readInt(u32, bytes[chunk_data + 4 ..][0..4], .little);
+            block_align = std.mem.readInt(u16, bytes[chunk_data + 12 ..][0..2], .little);
+            bits_per_sample = std.mem.readInt(u16, bytes[chunk_data + 14 ..][0..2], .little);
+            if (format_tag == 0xfffe and chunk_size >= 40) {
+                format_tag = std.mem.readInt(u16, bytes[chunk_data + 24 ..][0..2], .little);
+            }
+        } else if (std.mem.eql(u8, bytes[offset..][0..4], "data")) {
+            data_offset = chunk_data;
+            data_size = chunk_size;
+        } else if (std.mem.eql(u8, bytes[offset..][0..4], "smpl") and chunk_size >= 60) {
+            const loop_count = std.mem.readInt(u32, bytes[chunk_data + 28 ..][0..4], .little);
+            if (loop_count != 0) {
+                loop_start = std.mem.readInt(u32, bytes[chunk_data + 44 ..][0..4], .little);
+                const inclusive_end = std.mem.readInt(u32, bytes[chunk_data + 48 ..][0..4], .little);
+                loop_end = @as(usize, inclusive_end) +| 1;
+            }
+        }
+        const padded_size = std.math.add(usize, chunk_size, chunk_size & 1) catch return null;
+        offset = std.math.add(usize, chunk_data, padded_size) catch return null;
+    }
+    if ((format_tag != 1 and format_tag != 3) or channels == 0 or channels > 8 or
+        sample_rate == 0 or block_align == 0 or data_offset == 0 or data_size < block_align)
+    {
+        return null;
+    }
+    const bytes_per_sample = (bits_per_sample + 7) / 8;
+    if (bytes_per_sample == 0 or block_align < channels * bytes_per_sample) return null;
+    const frame_count = data_size / block_align;
+    const sample_count = std.math.mul(usize, frame_count, channels) catch return null;
+    if (sample_count == 0 or sample_count > 4 * 1024 * 1024) return null;
+    const samples = std.heap.page_allocator.alloc(f32, sample_count) catch return null;
+    const pcm = bytes[data_offset..][0 .. frame_count * block_align];
+    for (0..frame_count) |frame| {
+        for (0..channels) |channel| {
+            const sample_offset = frame * block_align + channel * bytes_per_sample;
+            const sample: f32 = if (format_tag == 3 and bits_per_sample == 32)
+                @bitCast(std.mem.readInt(u32, pcm[sample_offset..][0..4], .little))
+            else if (format_tag == 1) switch (bits_per_sample) {
+                8 => (@as(f32, @floatFromInt(pcm[sample_offset])) - 128.0) / 128.0,
+                16 => @as(f32, @floatFromInt(std.mem.readInt(i16, pcm[sample_offset..][0..2], .little))) / 32768.0,
+                24 => blk: {
+                    const raw = @as(u32, pcm[sample_offset]) |
+                        (@as(u32, pcm[sample_offset + 1]) << 8) |
+                        (@as(u32, pcm[sample_offset + 2]) << 16);
+                    const signed: i32 = @bitCast(if (raw & 0x0080_0000 != 0) raw | 0xff00_0000 else raw);
+                    break :blk @as(f32, @floatFromInt(signed)) / 8_388_608.0;
+                },
+                32 => @as(f32, @floatFromInt(std.mem.readInt(i32, pcm[sample_offset..][0..4], .little))) / 2_147_483_648.0,
+                else => 0,
+            } else 0;
+            samples[frame * channels + channel] = if (std.math.isFinite(sample))
+                std.math.clamp(sample, -1, 1)
+            else
+                0;
+        }
+    }
+    if (loop_start) |start| {
+        if (start >= frame_count or loop_end <= start or loop_end > frame_count) {
+            loop_start = null;
+            loop_end = frame_count;
+        }
+    } else {
+        loop_end = frame_count;
+    }
+    return .{
+        .samples = samples,
+        .sample_rate = sample_rate,
+        .channels = @intCast(channels),
+        .loop_start = loop_start,
+        .loop_end = loop_end,
+    };
+}
+
+fn ngs2ArmVoice(voice: *Ngs2Voice, address: u64) void {
+    if (address == 0) return;
+    if (voice.source_address == address and voice.samples.len != 0) {
+        voice.position = 0;
+        voice.state = .playing;
+        return;
+    }
+    if (ngs2FindCachedWaveform(address)) |cached_index| {
+        ngs2FreeVoiceWaveform(voice);
+        ngs2BindCachedWaveform(voice, cached_index);
+        return;
+    }
+    const decoded = ngs2DecodeWave(address) orelse ngs2DecodeVag(address) orelse {
+        const log_index = ngs2_waveform_logs.fetchAdd(1, .monotonic);
+        if (log_index < 16) std.debug.print(
+            "[audio] NGS2 unsupported sampler waveform @0x{x}\n",
+            .{address},
+        );
+        return;
+    };
+    ngs2FreeVoiceWaveform(voice);
+    if (ngs2CacheWaveform(address, decoded)) |cached_index| {
+        ngs2BindCachedWaveform(voice, cached_index);
+    } else {
+        voice.source_address = address;
+        voice.source_rate = decoded.sample_rate;
+        voice.source_channels = decoded.channels;
+        voice.samples = decoded.samples;
+        voice.position = 0;
+        voice.loop_start = decoded.loop_start;
+        voice.loop_end = decoded.loop_end;
+        voice.state = .playing;
+    }
+    const log_index = ngs2_waveform_logs.fetchAdd(1, .monotonic);
+    if (log_index < 16) std.debug.print(
+        "[audio] NGS2 sampler armed voice=0x{x} source=0x{x} rate={d} channels={d} frames={d} loop={?d}-{d}\n",
+        .{ voice.handle, address, voice.source_rate, voice.source_channels, voice.samples.len / voice.source_channels, voice.loop_start, voice.loop_end },
+    );
+}
+
+fn ngs2SetPortVolume(voice: *Ngs2Voice, index: u32, volume: f32) i32 {
+    if (index >= voice.ports.len) return ngs2_error_invalid_port;
+    if (!std.math.isFinite(volume) or volume < 0 or volume > 8) return errno.KernelError.einval.raw();
+    voice.ports[index].volume = volume;
+    if (index == 0) voice.gain = volume;
+    return errno.ok;
+}
+
+fn ngs2SetPortMatrix(voice: *Ngs2Voice, index: u32, matrix: i32) i32 {
+    if (index >= voice.ports.len) return ngs2_error_invalid_port;
+    const rack = ngs2FindRack(voice.rack) orelse return ngs2_error_invalid_voice;
+    if (matrix < -1 or (matrix >= 0 and @as(u32, @intCast(matrix)) >= rack.options.max_matrices)) return ngs2_error_invalid_matrix;
+    voice.ports[index].matrix_id = matrix;
+    return errno.ok;
+}
+
+fn ngs2VoiceGetPortInfo(handle: u64, index: u32, output: u64, size: usize) callconv(abi.guest) i32 {
+    if (output == 0) return ngs2_error_invalid_output;
+    if (size != @sizeOf(Ngs2VoicePortInfo)) return @bitCast(@as(u32, 0x804a8011));
+    // Readable is insufficient here: a query must not write into read-only
+    // guest pages. Host-backed CRT/stack allocations need the same check.
+    const memory = @import("memory");
+    const space = kernel_memory.attachedAddressSpace();
+    if (!(if (space) |s| s.isWritable(output, size) else false) and !memory.isHostRangeWritable(output, size)) return errno.KernelError.efault.raw();
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const voice = ngs2FindVoice(handle) orelse return ngs2_error_invalid_voice;
+    if (index >= voice.ports.len) return ngs2_error_invalid_port;
+    if (space) |s| s.notifyGuestWrite(output, size);
+    @as(*align(1) Ngs2VoicePortInfo, @ptrFromInt(output)).* = voice.ports[index];
+    return errno.ok;
+}
+
+fn ngs2VoiceQueryInfo(handle: u64, info_id: u32, output: u64, size: usize) callconv(abi.guest) i32 {
+    if (output == 0) return ngs2_error_invalid_query_output;
+    // Do not report success for unknown records or guess their layout.
+    if (info_id != ngs2_voice_info_channels) return errno.KernelError.einval.raw();
+    if (size != @sizeOf(Ngs2VoiceChannelsInfo)) return ngs2_error_invalid_query_size;
+    const memory = @import("memory");
+    const space = kernel_memory.attachedAddressSpace();
+    if (!(if (space) |s| s.isWritable(output, size) else false) and !memory.isHostRangeWritable(output, size)) return errno.KernelError.efault.raw();
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const voice = ngs2FindVoice(handle) orelse return ngs2_error_invalid_voice;
+    if (space) |s| s.notifyGuestWrite(output, size);
+    @as(*align(1) Ngs2VoiceChannelsInfo, @ptrFromInt(output)).* = .{ .num_channels = voice.source_channels };
+    return errno.ok;
+}
+
+fn ngs2VoiceControl(handle: u64, params_address: u64) callconv(abi.guest) i32 {
+    if (params_address == 0) return errno.KernelError.einval.raw();
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const voice = ngs2FindVoice(handle) orelse return errno.KernelError.einval.raw();
+
+    var address = params_address;
+    for (0..256) |_| {
+        if (!kernel_memory.isGuestRangeAccessible(address, @sizeOf(Ngs2VoiceParamHeader))) {
+            return errno.KernelError.efault.raw();
+        }
+        const header: *const Ngs2VoiceParamHeader = @ptrFromInt(address);
+        if (header.size < @sizeOf(Ngs2VoiceParamHeader)) return errno.KernelError.einval.raw();
+        if (!kernel_memory.isGuestRangeAccessible(address, header.size)) return errno.KernelError.efault.raw();
+
+        const rack_id = header.id >> 16;
+        const command_id = header.id & 0x7fff;
+        // The custom sampler rack (0x4001) takes the sampler's own voice
+        // parameters: waveform format, blocks and pitch.
+        const sampler_command: ?u32 = if ((rack_id == 0x1000 or rack_id == 0x4001) and header.id & 0x8000 == 0)
+            header.id & 0xffff
+        else
+            null;
+        if (trace.isLive() and sampler_command != null and command_id <= 1) {
+            const detail = &ngs2_sampler_detail_logs[command_id];
+            if (detail.* < 16) {
+                detail.* += 1;
+                std.debug.print("[audio] NGS2 sampler voice=0x{x} id=0x{x} bytes={x}\n", .{ handle, header.id, @as([*]const u8, @ptrFromInt(address))[0..@min(header.size, 40)] });
+                if (command_id == 1 and header.size >= 32) {
+                    const data = @as([*]const u8, @ptrFromInt(address))[0..32];
+                    const blocks = std.mem.readInt(u64, data[24..32], .little);
+                    if (kernel_memory.isGuestRangeAccessible(blocks, 40)) std.debug.print("[audio] NGS2 first block={x}\n", .{@as([*]const u8, @ptrFromInt(blocks))[0..40]});
+                }
+            }
+        }
+        const log_index = ngs2_control_logs.fetchAdd(1, .monotonic);
+        if (trace.isLive() and log_index < 128) std.debug.print(
+            "[audio] NGS2 voice=0x{x} param id=0x{x} size={d} next={d}\n",
+            .{ handle, header.id, header.size, header.next },
+        );
+        if (rack_id == 0 and command_id == 0x0006) {
+            if (header.size < @sizeOf(Ngs2VoiceEventParam)) return errno.KernelError.einval.raw();
+            const event: *const Ngs2VoiceEventParam = @ptrFromInt(address);
+            voice.event = ngs2Event(event.event_id) orelse return errno.KernelError.einval.raw();
+            if (trace.isLive() and log_index < 128) std.debug.print(
+                "[audio] NGS2 voice=0x{x} event=0x{x}\n",
+                .{ handle, event.event_id },
+            );
+        } else if (sampler_command == 0) {
+            if (header.size < 32) return errno.KernelError.einval.raw();
+            const format: *align(1) const Ngs2WaveformFormat = @ptrFromInt(address + 8);
+            // Reject an invalid PCM setup before replacing the working voice
+            // or publishing its channel count through VoiceQueryInfo.
+            if ((format.waveform_type == 0x12 or format.waveform_type == 0x18) and
+                (format.channels == 0 or format.channels > 8 or format.sample_rate < 8000 or format.sample_rate > 192000)) return errno.KernelError.einval.raw();
+            if (ngs2_format_logs.fetchAdd(1, .monotonic) < 8) std.debug.print(
+                "[audio] NGS2 voice=0x{x} rack=0x{x} format type=0x{x} channels={d} rate={d} config=0x{x}\n",
+                .{ handle, rack_id, format.waveform_type, format.channels, format.sample_rate, format.config_data },
+            );
+            ngs2FreeVoiceWaveform(voice);
+            ngs2FreeAtrac9(voice);
+            if (voice.pcm) |*pcm| pcm.deinit(std.heap.page_allocator);
+            voice.pcm = null;
+            voice.state = .empty;
+            voice.event = .none;
+            @memset(voice.ports, .{});
+            voice.gain = 1;
+            voice.source_rate = format.sample_rate;
+            voice.source_channels = 0;
+            if (format.waveform_type == 0x12 or format.waveform_type == 0x18) {
+                voice.pcm = .{ .format = .{ .channels = @intCast(format.channels), .rate = format.sample_rate, .float32 = format.waveform_type == 0x18 } };
+            } else if (format.waveform_type == 0x40) {
+                const stream = std.heap.page_allocator.create(ngs2_atrac9.Stream) catch return errno.KernelError.enomem.raw();
+                stream.* = ngs2_atrac9.Stream.init(std.heap.page_allocator, format.*) catch {
+                    std.heap.page_allocator.destroy(stream);
+                    return errno.KernelError.einval.raw();
+                };
+                voice.atrac9 = stream;
+            }
+            voice.source_channels = @intCast(@min(format.channels, 8));
+        } else if (sampler_command == 1) {
+            if (header.size < @sizeOf(Ngs2VoiceWaveformParam)) return errno.KernelError.einval.raw();
+            const waveform: *const Ngs2VoiceWaveformParam = @ptrFromInt(address);
+            if (voice.pcm != null or voice.atrac9 != null) {
+                if (header.size < 32) return errno.KernelError.einval.raw();
+                const bytes = @as([*]const u8, @ptrFromInt(address))[0..32];
+                const flags = std.mem.readInt(u32, bytes[16..20], .little);
+                const count = std.mem.readInt(u32, bytes[20..24], .little);
+                const blocks_address = std.mem.readInt(u64, bytes[24..32], .little);
+                if (count > ngs2_pcm.max_blocks or flags & ~@as(u32, if (voice.atrac9 != null) 0x17 else 0x15) != 0) return errno.KernelError.einval.raw();
+                if (count != 0 and !kernel_memory.isGuestRangeAccessible(blocks_address, @as(u64, count) * @sizeOf(Ngs2WaveformBlock))) return errno.KernelError.efault.raw();
+                var queued: [ngs2_pcm.max_blocks]ngs2_pcm.Block = undefined;
+                const blocks: []align(1) const Ngs2WaveformBlock = if (count == 0) &.{} else @as([*]align(1) const Ngs2WaveformBlock, @ptrFromInt(blocks_address))[0..count];
+                var used: usize = 0;
+                for (blocks) |block| {
+                    if (block.samples == 0 and block.data_size == 0) continue;
+                    const data_address = std.math.add(u64, waveform.data_address, block.data_offset) catch return errno.KernelError.einval.raw();
+                    if (block.data_size > maximum_ngs2_waveform_bytes or !kernel_memory.isGuestRangeAccessible(data_address, block.data_size)) return errno.KernelError.efault.raw();
+                    queued[used] = .{ .data = @as([*]const u8, @ptrFromInt(data_address))[0..block.data_size], .skip = block.skip_samples, .frames = block.samples, .repeats = block.repeats, .user_data = block.user_data };
+                    used += 1;
+                }
+                if (voice.pcm) |*pcm| {
+                    pcm.append(std.heap.page_allocator, queued[0..used], flags & 4 != 0, flags & 1 != 0) catch return errno.KernelError.einval.raw();
+                } else if (voice.atrac9) |stream| {
+                    stream.append(std.heap.page_allocator, queued[0..used], flags & 4 != 0, flags & 1 != 0, flags & 2 != 0) catch return errno.KernelError.einval.raw();
+                }
+            } else {
+                ngs2ArmVoice(voice, waveform.data_address);
+            }
+        } else if (sampler_command == 4) {
+            if (voice.pcm) |*pcm| for (pcm.blocks.items[pcm.cursor.block..]) |*block| {
+                block.repeats = 0;
+            };
+            if (voice.atrac9) |stream| for (stream.blocks.items) |*block| {
+                block.repeats = 0;
+            };
+        } else if (sampler_command == 5 and header.size >= 12) {
+            const pitch = @as(*align(1) const f32, @ptrFromInt(address + 8)).*;
+            if (!std.math.isFinite(pitch) or pitch < 0 or pitch > 4) return errno.KernelError.einval.raw();
+            if (voice.pcm) |*pcm| pcm.pitch = pitch;
+            if (voice.atrac9) |stream| stream.pitch = pitch;
+        } else if (header.id == 0x20000000 or header.id == 0x30000000 or header.id == 0x20010000 or header.id == 0x40020000) {
+            // Preserve mixer setup metadata for channel queries. Rendering
+            // the graph's reverb/custom effects is separate from this query.
+            const owner = ngs2FindRack(voice.rack) orelse return ngs2_error_invalid_voice;
+            if (owner.rack_id != rack_id) return errno.KernelError.einval.raw();
+            const separate_io = rack_id == 0x2001 or rack_id == 0x4002;
+            if (header.size < (if (separate_io) @as(u16, 24) else @as(u16, 16))) return errno.KernelError.einval.raw();
+            const input_channels = @as(*align(1) const u32, @ptrFromInt(address + 8)).*;
+            const output_channels = if (separate_io) @as(*align(1) const u32, @ptrFromInt(address + 12)).* else input_channels;
+            if (input_channels == 0 or input_channels > 8 or output_channels == 0 or output_channels > 8) return errno.KernelError.einval.raw();
+            voice.source_channels = @intCast(output_channels);
+        } else if (header.id >= 2 and header.id <= 5) {
+            if (header.size < (if (header.id == 5) @as(u16, 24) else @as(u16, 16))) return errno.KernelError.einval.raw();
+            const index = @as(*align(1) const u32, @ptrFromInt(address + 8)).*;
+            if (index >= voice.ports.len) return ngs2_error_invalid_port;
+            const value = @as(*align(1) const u32, @ptrFromInt(address + 12)).*;
+            const result = switch (header.id) {
+                2 => ngs2SetPortVolume(voice, index, @bitCast(value)),
+                3 => ngs2SetPortMatrix(voice, index, @bitCast(value)),
+                4 => blk: {
+                    voice.ports[index].num_delay_samples = value;
+                    break :blk errno.ok;
+                },
+                5 => blk: {
+                    const destination = @as(*align(1) const u64, @ptrFromInt(address + 16)).*;
+                    if (destination != 0) {
+                        const target = ngs2FindVoice(destination) orelse return ngs2_error_invalid_patch;
+                        const source_rack = ngs2FindRack(voice.rack) orelse return ngs2_error_invalid_voice;
+                        const target_rack = ngs2FindRack(target.rack) orelse return ngs2_error_invalid_patch;
+                        if (source_rack.system != target_rack.system or destination == handle or target_rack.rack_id == 0x1000) return ngs2_error_invalid_patch;
+                    }
+                    voice.ports[index].dest_handle = destination;
+                    voice.ports[index].dest_input_id = if (destination == 0) 0 else value;
+                    break :blk errno.ok;
+                },
+                else => unreachable,
+            };
+            if (result != errno.ok) return result;
+        }
+        if (header.next == 0) return errno.ok;
+        address = ngs2NextParam(address, header.next) orelse return errno.KernelError.einval.raw();
+    }
+    return errno.KernelError.einval.raw();
+}
+
+fn ngs2VoiceRunCommands(handle: u64, params_address: u64, command_count: u32, _: u32) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    const valid_voice = ngs2FindVoice(handle) != null;
+    ngs2_mutex.unlock();
+    if (!valid_voice) return errno.KernelError.einval.raw();
+    if (command_count == 0 or params_address == 0) return errno.ok;
+
+    const log_index = ngs2_command_logs.fetchAdd(1, .monotonic);
+    if (trace.isLive() and log_index < 64 and kernel_memory.isGuestRangeAccessible(params_address, 64)) {
+        const words: *const [8]u64 = @ptrFromInt(params_address);
+        std.debug.print(
+            "[audio] NGS2 commands voice=0x{x} count={d} words={x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16} {x:0>16}\n",
+            .{ handle, command_count, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7] },
+        );
+    }
+
+    if (command_count > 256 or !kernel_memory.isGuestRangeAccessible(params_address, @as(u64, command_count) * 16)) return errno.KernelError.efault.raw();
+    const commands = @as([*]const u8, @ptrFromInt(params_address))[0 .. command_count * 16];
+    // Compact commands have an ID, a typed scalar/array header and an 8-byte
+    // value. Their first word is not a VoiceParamHeader byte size.
+    if (commands[5] != 0) {
+        ngs2_mutex.lock();
+        defer ngs2_mutex.unlock();
+        const voice = ngs2FindVoice(handle) orelse return errno.KernelError.einval.raw();
+        for (0..command_count) |index| {
+            const command = commands[index * 16 ..][0..16];
+            const id = std.mem.readInt(u32, command[0..4], .little);
+            const value = std.mem.readInt(u32, command[8..12], .little);
+            switch (id & 0xffffff) {
+                2 => {
+                    if (command[5] != 4) return errno.KernelError.einval.raw();
+                    voice.event = ngs2Event(value) orelse return errno.KernelError.einval.raw();
+                },
+                6 => {
+                    if (command[5] != 1) return errno.KernelError.einval.raw();
+                    const result = ngs2SetPortVolume(voice, id >> 24, @bitCast(value));
+                    if (result != errno.ok) return result;
+                },
+                7 => {
+                    if (command[5] != 3) return errno.KernelError.einval.raw();
+                    const result = ngs2SetPortMatrix(voice, id >> 24, @bitCast(value));
+                    if (result != errno.ok) return result;
+                },
+                else => {}, // Existing graph/matrix controls remain accepted.
+            }
+        }
+        return errno.ok;
+    }
+
+    // Some SDK revisions pass the ordinary parameter-list representation to
+    // this entry point. Only route lists whose header is structurally valid;
+    // other revisions use a distinct compact command format and must remain
+    // accepted until their opcode is decoded.
+    if (kernel_memory.isGuestRangeAccessible(params_address, @sizeOf(Ngs2VoiceParamHeader))) {
+        const header: *const Ngs2VoiceParamHeader = @ptrFromInt(params_address);
+        if (header.size >= @sizeOf(Ngs2VoiceParamHeader) and header.size <= 0x1000) {
+            return ngs2VoiceControl(handle, params_address);
+        }
+    }
+    return errno.ok;
+}
+
+fn ngs2StateFlags(state: Ngs2VoiceState) u32 {
+    return switch (state) {
+        .empty => 0,
+        .playing => 0x3,
+        .paused => 0x5,
+        .stopped => 0xb,
+    };
+}
+
+fn ngs2ApplyEventsLocked(system_handle: u64) void {
+    for (&ngs2_racks) |*rack| {
+        if (!rack.active or rack.system != system_handle) continue;
+        for (ngs2_voices.items) |*voice| {
+            if (!voice.active or voice.rack != rack.handle) continue;
+            switch (voice.event) {
+                .none => {},
+                .play => if (voice.state == .empty or voice.state == .stopped) {
+                    voice.position = 0;
+                    voice.state = .playing;
+                },
+                .pause => if (voice.state == .playing) {
+                    voice.state = .paused;
+                },
+                .resume_playback => if (voice.state == .paused) {
+                    voice.state = .playing;
+                },
+                .stop => if (voice.state == .playing or voice.state == .paused) {
+                    voice.state = .stopped;
+                },
+                .stop_immediate, .kill => {
+                    voice.state = .empty;
+                    if (voice.pcm) |*pcm| pcm.clear();
+                    if (voice.atrac9) |stream| stream.clear();
+                },
+            }
+            voice.event = .none;
+        }
+    }
+}
+
+fn ngs2ParseWaveformData(
+    data_address: u64,
+    data_size: usize,
+    output: ?*Ngs2WaveformInfo,
+) callconv(abi.guest) i32 {
+    const info = output orelse return ngs2_error_invalid_output;
+    if (data_address == 0 or data_size == 0 or
+        !kernel_memory.isGuestRangeAccessible(data_address, data_size) or
+        !kernel_memory.isGuestRangeAccessible(@intFromPtr(info), @sizeOf(Ngs2WaveformInfo)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    info.* = .{};
+    info.format = .{ .waveform_type = 0x80, .channels = 1, .sample_rate = 48_000 };
+    info.data_size = @intCast(@min(data_size, std.math.maxInt(u32)));
+    info.audio_unit_samples = 1;
+    info.audio_units_per_frame = 1;
+    info.audio_frame_samples = 1;
+
+    // NGS2 accepts ordinary RIFF/WAVE assets directly. Preserve the useful
+    // geometry instead of returning a generic one-channel placeholder: JnG2
+    // uses it to size voices for hundreds of loose PCM sound effects.
+    const bytes: [*]const u8 = @ptrFromInt(data_address);
+    const input = bytes[0..data_size];
+    // Use the same checked metadata parser as the file entry point. ATRAC9
+    // effects are RIFF containers too; reporting them as generic type 0x80
+    // loses the codec configuration, preroll and compressed block geometry.
+    if (ngs2_waveform.parse(ngs2_waveform.MemoryReader{ .bytes = input }, input.len)) |parsed| {
+        info.* = parsed;
+        return errno.ok;
+    } else |err| {
+        // Retain the older container decoder for PCM widths and VAG that the
+        // streaming parser does not support yet, but reject malformed RIFF.
+        if (err != error.UnknownFormat) return @bitCast(@as(u32, if (err == error.InvalidData) 0x804a8430 else 0x804a8431));
+    }
+    if (input.len < 12 or !std.mem.eql(u8, input[0..4], "RIFF") or !std.mem.eql(u8, input[8..12], "WAVE")) {
+        return errno.ok;
+    }
+    var block_align: u16 = 0;
+    var data_offset: usize = 0;
+    var wave_size: usize = 0;
+    var offset: usize = 12;
+    while (offset + 8 <= input.len) {
+        const chunk_size: usize = std.mem.readInt(u32, input[offset + 4 ..][0..4], .little);
+        const chunk_data = offset + 8;
+        if (chunk_size > input.len - chunk_data) break;
+        if (std.mem.eql(u8, input[offset..][0..4], "fmt ") and chunk_size >= 16) {
+            info.format.channels = std.mem.readInt(u16, input[chunk_data + 2 ..][0..2], .little);
+            info.format.sample_rate = std.mem.readInt(u32, input[chunk_data + 4 ..][0..4], .little);
+            block_align = std.mem.readInt(u16, input[chunk_data + 12 ..][0..2], .little);
+        } else if (std.mem.eql(u8, input[offset..][0..4], "data")) {
+            data_offset = chunk_data;
+            wave_size = chunk_size;
+            break;
+        }
+        offset = chunk_data + chunk_size + (chunk_size & 1);
+    }
+    if (data_offset == 0) return errno.ok;
+    const bounded_size = @min(wave_size, std.math.maxInt(u32));
+    info.data_offset = @intCast(data_offset);
+    info.data_size = @intCast(bounded_size);
+    info.audio_unit_size = block_align;
+    info.audio_frame_size = block_align;
+    if (block_align != 0) info.samples = @intCast(bounded_size / block_align);
+    info.loop_end = info.samples;
+    info.block_count = 1;
+    info.blocks[0] = .{
+        .data_offset = data_offset,
+        .data_size = bounded_size,
+        .samples = info.samples,
+    };
+    return errno.ok;
+}
+
+const Ngs2FileReader = struct {
+    descriptor: i32,
+    base: u64,
+    pub fn read(self: Ngs2FileReader, offset: u64, bytes: []u8) !void {
+        var done: usize = 0;
+        while (done < bytes.len) {
+            const count = try filesystem.pread(self.descriptor, bytes[done..], self.base + offset + done);
+            if (count == 0) return error.InvalidData;
+            done += count;
+        }
+    }
+};
+
+fn ngs2ParseWaveformFile(path: ?[*:0]const u8, offset: u32, output: ?*Ngs2WaveformInfo) callconv(abi.guest) i32 {
+    const invalid_data: i32 = @bitCast(@as(u32, 0x804a8430));
+    const info = output orelse return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(info), @sizeOf(Ngs2WaveformInfo))) return errno.KernelError.efault.raw();
+    const name = path orelse return invalid_data;
+    var length: usize = 0;
+    while (length < 4096) : (length += 1) {
+        if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(name) + length, 1)) return errno.KernelError.efault.raw();
+        if (name[length] == 0) break;
+    }
+    if (length == 0 or length == 4096) return invalid_data;
+    const fd = filesystem.open(name[0..length], 0) catch return invalid_data;
+    defer filesystem.close(fd) catch {};
+    var stat: filesystem.Stat = .{};
+    filesystem.fstat(fd, &stat) catch return invalid_data;
+    if (stat.size < offset) return invalid_data;
+    var parsed = ngs2_waveform.parse(Ngs2FileReader{ .descriptor = fd, .base = offset }, @as(u64, @intCast(stat.size)) - offset) catch |err| return switch (err) {
+        error.InvalidData => invalid_data,
+        error.InvalidFormat => @bitCast(@as(u32, 0x804a8431)),
+        error.UnknownFormat => @bitCast(@as(u32, 0x804a8432)),
+    };
+    parsed.data_offset = std.math.add(u32, parsed.data_offset, offset) catch return invalid_data;
+    for (parsed.blocks[0..parsed.block_count]) |*block| block.data_offset += offset;
+    if (kernel_memory.attachedAddressSpace()) |space| space.notifyGuestWrite(@intFromPtr(info), @sizeOf(Ngs2WaveformInfo));
+    info.* = parsed;
+    return errno.ok;
+}
+
+fn ngs2CalcWaveformBlock(
+    format: ?*const Ngs2WaveformFormat,
+    _: u32,
+    samples: u32,
+    output: ?*Ngs2WaveformBlock,
+) callconv(abi.guest) i32 {
+    if (format == null) return errno.KernelError.einval.raw();
+    const block = output orelse return ngs2_error_invalid_output;
+    block.* = .{ .samples = samples };
+    return errno.ok;
+}
+
+/// Bound the configured render grain by the smallest output capacity. Buffer
+/// capacity can exceed the system grain and must not set the playback clock.
+fn ngs2RenderFrameCount(buffers: []const Ngs2RenderBuffer) u32 {
+    var result: u64 = 0;
+    for (buffers) |buffer| {
+        if (buffer.size == 0 or buffer.channels == 0 or buffer.channels > 32) continue;
+        const bytes_per_frame = @as(u64, buffer.channels) * @sizeOf(f32);
+        const frames = buffer.size / bytes_per_frame;
+        if (frames == 0) continue;
+        result = if (result == 0) frames else @min(result, frames);
+    }
+    // A corrupt descriptor must not suspend a guest thread for seconds.  NGS2
+    // grains are short (JnG2 uses 256 samples); 4096 is already 85 ms at 48 kHz.
+    return @intCast(@min(result, 4096));
+}
+
+fn ngs2VoiceBelongsToSystem(voice: *const Ngs2Voice, system: u64) bool {
+    for (&ngs2_racks) |*rack| {
+        if (rack.active and rack.handle == voice.rack) return rack.system == system;
+    }
+    return false;
+}
+
+fn ngs2SourceSample(voice: *const Ngs2Voice, frame: usize, channel: usize) f32 {
+    const source_channels: usize = voice.source_channels;
+    if (source_channels == 0) return 0;
+    const source_channel = @min(channel, source_channels - 1);
+    const index = frame * source_channels + source_channel;
+    return if (index < voice.samples.len) voice.samples[index] else 0;
+}
+
+fn ngs2MixBufferLocked(
+    system: u64,
+    buffer: Ngs2RenderBuffer,
+    frames: u32,
+    advance_voices: bool,
+) void {
+    if (buffer.address == 0 or buffer.size == 0 or buffer.channels == 0 or buffer.channels > 32) return;
+    const output_channels: usize = buffer.channels;
+    const capacity: usize = @intCast(buffer.size / @sizeOf(f32));
+    const output_frames = @min(@as(usize, frames), capacity / output_channels);
+    if (output_frames == 0) return;
+    const destination: [*]f32 = @ptrFromInt(buffer.address);
+    const output = destination[0 .. output_frames * output_channels];
+    const sample_rate = (ngs2FindSystem(system) orelse return).sample_rate;
+
+    for (ngs2_voices.items) |*voice| {
+        if (!voice.active or voice.state != .playing or
+            voice.source_channels == 0 or !ngs2VoiceBelongsToSystem(voice, system)) continue;
+        if (voice.pcm) |*pcm| {
+            var accessible = true;
+            for (pcm.blocks.items[pcm.cursor.block..]) |block| {
+                if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(block.data.ptr), block.data.len)) {
+                    accessible = false;
+                    break;
+                }
+            }
+            if (!accessible) continue;
+            pcm.mix(output, output_channels, sample_rate, voice.gain, advance_voices);
+            if (advance_voices and pcm.finished()) voice.state = .empty;
+            continue;
+        }
+        if (voice.atrac9) |stream| {
+            stream.mix(output, output_channels, voice.gain);
+            if (advance_voices and stream.finished()) voice.state = .empty;
+            continue;
+        }
+        if (voice.samples.len == 0) continue;
+        const source_channels: usize = voice.source_channels;
+        const source_frames = voice.samples.len / source_channels;
+        const playback_end = @min(if (voice.loop_end != 0) voice.loop_end else source_frames, source_frames);
+        if (playback_end == 0) continue;
+        const step = @as(f64, @floatFromInt(voice.source_rate)) / @as(f64, @floatFromInt(sample_rate));
+        var position = voice.position;
+        var ended = false;
+        for (0..output_frames) |output_frame| {
+            var source_frame: usize = @intFromFloat(@max(position, 0));
+            if (source_frame >= playback_end) {
+                if (voice.loop_start) |loop_start| {
+                    if (loop_start < playback_end) {
+                        const loop_length = playback_end - loop_start;
+                        const overshoot = source_frame - playback_end;
+                        source_frame = loop_start + overshoot % loop_length;
+                        position = @floatFromInt(source_frame);
+                    } else {
+                        ended = true;
+                        break;
+                    }
+                } else {
+                    ended = true;
+                    break;
+                }
+            }
+            var next_frame = source_frame + 1;
+            if (next_frame >= playback_end) next_frame = voice.loop_start orelse source_frame;
+            const fraction: f32 = @floatCast(position - @as(f64, @floatFromInt(source_frame)));
+            const left0 = ngs2SourceSample(voice, source_frame, 0);
+            const left1 = ngs2SourceSample(voice, next_frame, 0);
+            const left = (left0 + (left1 - left0) * fraction) * voice.gain;
+            const right = if (source_channels > 1) blk: {
+                const right0 = ngs2SourceSample(voice, source_frame, 1);
+                const right1 = ngs2SourceSample(voice, next_frame, 1);
+                break :blk (right0 + (right1 - right0) * fraction) * voice.gain;
+            } else left;
+            const base = output_frame * output_channels;
+            output[base] = std.math.clamp(output[base] + left, -1, 1);
+            if (output_channels > 1) output[base + 1] = std.math.clamp(output[base + 1] + right, -1, 1);
+            position += step;
+        }
+        if (advance_voices) {
+            voice.position = position;
+            if (ended) voice.state = .empty;
+        }
+    }
+    for (output) |*sample| sample.* = std.math.clamp(sample.*, -1, 1);
+}
+
+fn ngs2SystemRender(system: u64, buffers_address: u64, count: u32) callconv(abi.guest) i32 {
+    if (system == 0) return errno.KernelError.einval.raw();
+    if (count == 0) {
+        ngs2_mutex.lock();
+        defer ngs2_mutex.unlock();
+        return if (ngs2FindSystem(system) == null) errno.KernelError.einval.raw() else errno.ok;
+    }
+    if (buffers_address == 0 or count > 32 or
+        !kernel_memory.isGuestRangeAccessible(buffers_address, @as(u64, count) * @sizeOf(Ngs2RenderBuffer)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    const buffers: [*]const Ngs2RenderBuffer = @ptrFromInt(buffers_address);
+    const render_buffers = buffers[0..count];
+    var last_bus: ?usize = null;
+    // Validate before taking the mixer lock or writing any bus.
+    for (render_buffers, 0..) |buffer, index| {
+        if (buffer.address == 0 or buffer.size == 0) continue;
+        if (buffer.size > 16 * 1024 * 1024 or !kernel_memory.isGuestRangeAccessible(buffer.address, buffer.size)) return errno.KernelError.efault.raw();
+        if (buffer.channels != 0 and buffer.channels <= 32 and buffer.waveform_type == 0x18 and buffer.size >= @as(u64, buffer.channels) * @sizeOf(f32)) last_bus = index;
+    }
+    ngs2_mutex.lock();
+    const audio_system = ngs2FindSystem(system) orelse {
+        ngs2_mutex.unlock();
+        return errno.KernelError.einval.raw();
+    };
+    const frames = @min(audio_system.grain, ngs2RenderFrameCount(render_buffers));
+    audio_system.render_count +%= 1;
+    ngs2ApplyEventsLocked(system);
+    if (last_bus != null) for (ngs2_voices.items) |*voice| {
+        if (!voice.active or voice.state != .playing or !ngs2VoiceBelongsToSystem(voice, system)) continue;
+        const stream = voice.atrac9 orelse continue;
+        var accessible = true;
+        for (stream.blocks.items[stream.wave_first orelse stream.cursor.block ..]) |block| {
+            if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(block.data.ptr), block.data.len)) {
+                accessible = false;
+                break;
+            }
+        }
+        if (!accessible) {
+            voice.state = .empty;
+            continue;
+        }
+        stream.render(std.heap.page_allocator, frames, audio_system.sample_rate) catch |err| {
+            std.debug.print("[audio] NGS2 ATRAC9 voice=0x{x} failed: {s}\n", .{ voice.handle, @errorName(err) });
+            voice.state = .empty;
+        };
+    };
+    for (render_buffers, 0..) |buffer, index| {
+        if (buffer.address == 0 or buffer.size == 0) continue;
+        const usable = buffer.channels != 0 and buffer.channels <= 32 and
+            buffer.waveform_type == 0x18 and buffer.size >= @as(u64, buffer.channels) * @sizeOf(f32);
+        if (!usable) continue;
+        const bytes = @min(buffer.size, @as(u64, frames) * buffer.channels * @sizeOf(f32));
+        const destination: [*]u8 = @ptrFromInt(buffer.address);
+        @memset(destination[0..bytes], 0);
+        // Re-read the same stream cursor for each bus; consume it only once.
+        ngs2MixBufferLocked(system, buffer, frames, index == last_bus.?);
+    }
+    ngs2_mutex.unlock();
+    const call_index = ngs2_render_calls.fetchAdd(1, .monotonic);
+    if (call_index < 4) std.debug.print(
+        "[audio] NGS2 render buffers={d} grain={d} frames @48000Hz\n",
+        .{ count, frames },
+    );
+    // This is a synchronous software mix. AudioOut owns the playback clock;
+    // sleeping here as well slows the producer and underfeeds the device.
+    return errno.ok;
+}
+
+fn ngs2VoiceGetState(handle: u64, state_address: u64, state_size: usize) callconv(abi.guest) i32 {
+    ngs2_mutex.lock();
+    const voice = ngs2FindVoice(handle) orelse {
+        ngs2_mutex.unlock();
+        return errno.KernelError.einval.raw();
+    };
+    const state_flags = ngs2StateFlags(voice.state);
+    const pcm_cursor = if (voice.pcm) |*pcm| pcm.cursor else if (voice.atrac9) |stream| stream.cursor else ngs2_pcm.Cursor{};
+    const read_address = if (voice.pcm) |*pcm| pcm.readAddress() else if (voice.atrac9) |stream| stream.readAddress() else @as(u64, 0);
+    ngs2_mutex.unlock();
+    if (state_address != 0 and state_size != 0) {
+        const bounded_size = @min(state_size, 0x400);
+        if (!kernel_memory.isGuestRangeAccessible(state_address, bounded_size)) return errno.KernelError.efault.raw();
+        const destination: [*]u8 = @ptrFromInt(state_address);
+        @memset(destination[0..bounded_size], 0);
+        if (bounded_size >= @sizeOf(u32)) {
+            const flags: *align(1) u32 = @ptrFromInt(state_address);
+            flags.* = state_flags;
+        }
+        if (bounded_size >= 56) {
+            std.mem.writeInt(u64, destination[24..32], pcm_cursor.decoded_frames, .little);
+            std.mem.writeInt(u64, destination[32..40], pcm_cursor.decoded_bytes, .little);
+            std.mem.writeInt(u64, destination[40..48], pcm_cursor.user_data, .little);
+            std.mem.writeInt(u64, destination[48..56], read_address, .little);
+        }
+    }
+    return errno.ok;
+}
+
+fn ngs2VoiceGetStateFlags(handle: u64, output: ?*u32) callconv(abi.guest) i32 {
+    const flags = output orelse return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(@intFromPtr(flags), @sizeOf(u32))) return errno.KernelError.efault.raw();
+    ngs2_mutex.lock();
+    defer ngs2_mutex.unlock();
+    const voice = ngs2FindVoice(handle) orelse return errno.KernelError.einval.raw();
+    flags.* = ngs2StateFlags(voice.state);
+    const log_index = ngs2_state_logs.fetchAdd(1, .monotonic);
+    if (trace.isLive() and log_index < 128) std.debug.print(
+        "[audio] NGS2 voice=0x{x} state={s} flags=0x{x}\n",
+        .{ handle, @tagName(voice.state), flags.* },
+    );
+    return errno.ok;
+}
+
+fn ngs2PanInit(work_address: u64, _: u64, _: f32, _: u32) callconv(abi.guest) i32 {
+    if (work_address == 0) return errno.KernelError.einval.raw();
+    // The exact work area is SDK-private; callers only pass it back to the pan
+    // query, so no host state has to be embedded in guest memory.
+    return errno.ok;
+}
+
+fn ngs2PanGetVolumeMatrix(_: u64, _: u64, count: u32, format: u32, output_address: u64) callconv(abi.guest) i32 {
+    if (count == 0) return errno.ok;
+    const channel_count: usize = if (format == 0) 2 else @min(format, 8);
+    const float_count = std.math.mul(usize, count, channel_count) catch return errno.KernelError.einval.raw();
+    const byte_size = std.math.mul(usize, float_count, @sizeOf(f32)) catch return errno.KernelError.einval.raw();
+    if (!kernel_memory.isGuestRangeAccessible(output_address, byte_size)) return errno.KernelError.efault.raw();
+    const matrix: [*]f32 = @ptrFromInt(output_address);
+    @memset(matrix[0..float_count], 0);
+    for (0..count) |row| matrix[row * channel_count] = 1.0;
+    return errno.ok;
+}
+
+fn ngs2GeomResetListenerParam(param_address: u64) callconv(abi.guest) i32 {
+    if (param_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(param_address, @sizeOf(ngs2_geom.ListenerParam))) return errno.KernelError.efault.raw();
+    var param: ngs2_geom.ListenerParam = undefined;
+    ngs2_geom.resetListener(&param);
+    @as(*align(1) ngs2_geom.ListenerParam, @ptrFromInt(param_address)).* = param;
+    return errno.ok;
+}
+
+fn ngs2GeomResetSourceParam(param_address: u64) callconv(abi.guest) i32 {
+    if (param_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(param_address, @sizeOf(ngs2_geom.SourceParam))) return errno.KernelError.efault.raw();
+    var param: ngs2_geom.SourceParam = undefined;
+    ngs2_geom.resetSource(&param);
+    @as(*align(1) ngs2_geom.SourceParam, @ptrFromInt(param_address)).* = param;
+    return errno.ok;
+}
+
+fn ngs2GeomCalcListener(param_address: u64, work_address: u64, flags: u32) callconv(abi.guest) i32 {
+    if (param_address == 0) return errno.KernelError.einval.raw();
+    if (work_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(param_address, @sizeOf(ngs2_geom.ListenerParam)) or
+        !kernel_memory.isGuestRangeAccessible(work_address, @sizeOf(ngs2_geom.ListenerWork)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    const param = @as(*align(1) const ngs2_geom.ListenerParam, @ptrFromInt(param_address)).*;
+    var work: ngs2_geom.ListenerWork = undefined;
+    ngs2_geom.calcListener(param, flags, &work) catch return errno.KernelError.einval.raw();
+    @as(*align(1) ngs2_geom.ListenerWork, @ptrFromInt(work_address)).* = work;
+    return errno.ok;
+}
+
+fn ngs2GeomApply(work_address: u64, source_address: u64, attribute_address: u64, _: u32) callconv(abi.guest) i32 {
+    if (work_address == 0 or source_address == 0) return errno.KernelError.einval.raw();
+    if (attribute_address == 0) return ngs2_error_invalid_output;
+    if (!kernel_memory.isGuestRangeAccessible(work_address, @sizeOf(ngs2_geom.ListenerWork)) or
+        !kernel_memory.isGuestRangeAccessible(source_address, @sizeOf(ngs2_geom.SourceParam)) or
+        !kernel_memory.isGuestRangeAccessible(attribute_address, @sizeOf(ngs2_geom.Attribute)))
+    {
+        return errno.KernelError.efault.raw();
+    }
+    const work = @as(*align(1) const ngs2_geom.ListenerWork, @ptrFromInt(work_address)).*;
+    const source = @as(*align(1) const ngs2_geom.SourceParam, @ptrFromInt(source_address)).*;
+    var attribute: ngs2_geom.Attribute = undefined;
+    ngs2_geom.apply(work, source, &attribute);
+    @as(*align(1) ngs2_geom.Attribute, @ptrFromInt(attribute_address)).* = attribute;
+    return errno.ok;
+}
+
+const ngs2_exports = [_]symbols.Export{
+    .{ .name = "sceNgs2CalcWaveformBlock", .function = trace.wrap("sceNgs2CalcWaveformBlock", &ngs2CalcWaveformBlock), .expect_id = "3pCNbVM11UA" },
+    .{ .name = "sceNgs2ParseWaveformData", .function = trace.wrap("sceNgs2ParseWaveformData", &ngs2ParseWaveformData), .expect_id = "hyVLT2VlOYk" },
+    .{ .name = "sceNgs2ParseWaveformFile", .function = trace.wrap("sceNgs2ParseWaveformFile", &ngs2ParseWaveformFile), .expect_id = "iprCTXPVWMI" },
+    .{ .name = "sceNgs2SystemCreateWithAllocator", .function = trace.wrap("sceNgs2SystemCreateWithAllocator", &ngs2SystemCreateWithAllocator), .expect_id = "mPYgU4oYpuY" },
+    .{ .name = "sceNgs2RackCreateWithAllocator", .function = trace.wrap("sceNgs2RackCreateWithAllocator", &ngs2RackCreateWithAllocator), .expect_id = "U546k6orxQo" },
+    .{ .name = "sceNgs2RackGetVoiceHandle", .function = trace.wrap("sceNgs2RackGetVoiceHandle", &ngs2RackGetVoiceHandle), .expect_id = "MwmHz8pAdAo" },
+    .{ .name = "sceNgs2RackGetInfo", .function = trace.wrap("sceNgs2RackGetInfo", &ngs2RackGetInfo), .expect_id = "M4LYATRhRUE" },
+    .{ .name = "sceNgs2VoiceControl", .function = trace.wrap("sceNgs2VoiceControl", &ngs2VoiceControl), .expect_id = "uu94irFOGpA" },
+    .{ .name = "sceNgs2VoiceRunCommands", .function = trace.wrap("sceNgs2VoiceRunCommands", &ngs2VoiceRunCommands), .expect_id = "AbYvTOZ8Pts" },
+    .{ .name = "sceNgs2RackDestroy", .function = trace.wrap("sceNgs2RackDestroy", &ngs2RackDestroy), .expect_id = "lCqD7oycmIM" },
+    .{ .name = "sceNgs2SystemDestroy", .function = trace.wrap("sceNgs2SystemDestroy", &ngs2SystemDestroy), .expect_id = "u-WrYDaJA3k" },
+    .{ .name = "sceNgs2SystemRender", .function = trace.wrap("sceNgs2SystemRender", &ngs2SystemRender), .expect_id = "i0VnXM-C9fc" },
+    // Reported unavailable, which is what this answered before the audio
+    // library grew implementations of its own. Nothing here keeps the
+    // per-system options a reset would restore, and dropping the export
+    // entirely would leave a title importing it with nothing to bind.
+    .{ .name = "sceNgs2SystemResetOption", .function = trace.wrap("sceNgs2SystemResetOption", &services.absent), .expect_id = "AQkj7C0f3PY" },
+    .{ .name = "sceNgs2PanInit", .function = trace.wrap("sceNgs2PanInit", &ngs2PanInit), .expect_id = "xa8oL9dmXkM" },
+    .{ .name = "sceNgs2PanGetVolumeMatrix", .function = trace.wrap("sceNgs2PanGetVolumeMatrix", &ngs2PanGetVolumeMatrix), .expect_id = "gbMKV+8Enuo" },
+    .{ .name = "sceNgs2VoiceGetState", .function = trace.wrap("sceNgs2VoiceGetState", &ngs2VoiceGetState), .expect_id = "-TOuuAQ-buE" },
+    .{ .name = "sceNgs2VoiceGetStateFlags", .function = trace.wrap("sceNgs2VoiceGetStateFlags", &ngs2VoiceGetStateFlags), .expect_id = "rEh728kXk3w" },
+    .{ .name = "sceNgs2VoiceGetPortInfo", .function = trace.wrap("sceNgs2VoiceGetPortInfo", &ngs2VoiceGetPortInfo), .expect_id = "WCayTgob7-o" },
+    .{ .name = "sceNgs2VoiceQueryInfo", .function = trace.wrap("sceNgs2VoiceQueryInfo", &ngs2VoiceQueryInfo), .expect_id = "9eic4AmjGVI" },
+    .{ .name = "sceNgs2SystemQueryBufferSize", .function = trace.wrap("sceNgs2SystemQueryBufferSize", &ngs2SystemQueryBufferSize), .expect_id = "pgFAiLR5qT4" },
+    .{ .name = "sceNgs2SystemCreate", .function = trace.wrap("sceNgs2SystemCreate", &ngs2SystemCreate), .expect_id = "koBbCMvOKWw" },
+    .{ .name = "sceNgs2RackQueryBufferSize", .function = trace.wrap("sceNgs2RackQueryBufferSize", &ngs2RackQueryBufferSize), .expect_id = "0eFLVCfWVds" },
+    .{ .name = "sceNgs2RackCreate", .function = trace.wrap("sceNgs2RackCreate", &ngs2RackCreate), .expect_id = "cLV4aiT9JpA" },
+    .{ .name = "sceNgs2GeomResetListenerParam", .function = trace.wrap("sceNgs2GeomResetListenerParam", &ngs2GeomResetListenerParam), .expect_id = "7Lcfo8SmpsU" },
+    .{ .name = "sceNgs2GeomResetSourceParam", .function = trace.wrap("sceNgs2GeomResetSourceParam", &ngs2GeomResetSourceParam), .expect_id = "0lbbayqDNoE" },
+    .{ .name = "sceNgs2GeomCalcListener", .function = trace.wrap("sceNgs2GeomCalcListener", &ngs2GeomCalcListener), .expect_id = "1WsleK-MTkE" },
+    .{ .name = "sceNgs2GeomApply", .function = trace.wrap("sceNgs2GeomApply", &ngs2GeomApply), .expect_id = "eF8yRCC6W64" },
+    .{ .name = "sceNgs2GetWaveformFrameInfo", .function = trace.wrap("sceNgs2GetWaveformFrameInfo", &services.absent), .expect_id = "ekGJmmoc8j4" },
+    .{ .name = "sceNgs2SystemLock", .function = trace.wrap("sceNgs2SystemLock", &ngs2SystemLock), .expect_id = "gThZqM5PYlQ" },
+    .{ .name = "sceNgs2SystemUnlock", .function = trace.wrap("sceNgs2SystemUnlock", &ngs2SystemUnlock), .expect_id = "JXRC5n0RQls" },
+};
+
+// libSceTextToSpeech2 -------------------------------------------------------
+// Speech synthesis has no host backend; every entry reports the service
+// absent so titles link and continue without spoken output.
+const tts2_exports = [_]symbols.Export{
+    .{ .name = "sceTextToSpeech2Initialize", .function = trace.wrap("sceTextToSpeech2Initialize", &services.absent), .expect_id = "UOjiprYwVNw" },
+    .{ .name = "sceTextToSpeech2Terminate", .function = trace.wrap("sceTextToSpeech2Terminate", &services.absent), .expect_id = "SoWHuVW0gpU" },
+    .{ .name = "sceTextToSpeech2Open", .function = trace.wrap("sceTextToSpeech2Open", &services.absent), .expect_id = "X0HZNbSiqyg" },
+    .{ .name = "sceTextToSpeech2Close", .function = trace.wrap("sceTextToSpeech2Close", &services.absent), .expect_id = "t4e879M-cSw" },
+    .{ .name = "sceTextToSpeech2Speak", .function = trace.wrap("sceTextToSpeech2Speak", &services.absent), .expect_id = "8ntsRd07EQA" },
+    .{ .name = "sceTextToSpeech2GetSpeechStatus", .function = trace.wrap("sceTextToSpeech2GetSpeechStatus", &services.absent), .expect_id = "08JSg9p6bgQ" },
+};
+
+// libSceAudiodec ---------------------------------------------------------
+
+const audiodec_type_atrac9: u32 = 1;
+const audiodec_type_mp3: u32 = 2;
+const audiodec_type_m4aac: u32 = 3;
+const audiodec_word_24bit: i32 = 0;
+const audiodec_word_16bit: i32 = 1;
+const audiodec_word_float: i32 = 2;
+
+const AudiodecAuInfo = extern struct {
+    size: u32,
+    address: ?[*]const u8,
+    data_size: u32,
+};
+
+const AudiodecPcmItem = extern struct {
+    size: u32,
+    address: ?[*]u8,
+    data_size: u32,
+};
+
+const AudiodecCtrl = extern struct {
+    parameter: ?*anyopaque,
+    bsi_info: ?*anyopaque,
+    au_info: ?*AudiodecAuInfo,
+    pcm_item: ?*AudiodecPcmItem,
+};
+
+const AudiodecParamAtrac9 = extern struct {
+    size: u32,
+    word_length: i32,
+    config_data: [4]u8,
+};
+
+const AudiodecAtrac9Info = extern struct {
+    size: u32,
+    channels: u32,
+    bitrate: u32,
+    sample_rate: u32,
+    superframe_size: u32,
+    frames_in_superframe: u32,
+    next_frame_size: u32,
+    frame_samples: u32,
+    result: i32,
+};
+
+const AudiodecParamMp3 = extern struct {
+    size: u32,
+    word_length: i32,
+};
+
+const AudiodecMp3Info = extern struct {
+    size: u32,
+    header: u32,
+    crc: u8,
+    mode: u8,
+    mode_extension: u8,
+    copyright: u8,
+    original: u8,
+    emphasis: u8,
+    reserved: [2]u8,
+    result: i32,
+};
+
+const AudiodecParamM4aac = extern struct {
+    size: u32,
+    word_length: i32,
+    config_number: u32,
+    sample_rate_index: u32,
+    maximum_channels: u32,
+    enable_heaac: u32,
+};
+
+const AudiodecM4aacInfo = extern struct {
+    size: u32,
+    sample_rate: u32,
+    channels: u32,
+    heaac: u32,
+    result: i32,
+};
+
+const LegacyAudiodec = struct {
+    active: bool = false,
+    codec_type: u32 = 0,
+    word_length: i32 = audiodec_word_16bit,
+    channels: u32 = 2,
+    sample_rate: u32 = 48_000,
+    frame_bytes: u32 = 1441,
+    frame_samples: u32 = 1152,
+    decoder: ajm_codec.Decoder = .{},
+};
+
+const maximum_audiodec_instances = 64;
+var audiodec_mutex: Lock = .{};
+var audiodec_init_count: [4]u32 = @splat(0);
+var audiodec_instances: [maximum_audiodec_instances]LegacyAudiodec =
+    [_]LegacyAudiodec{.{}} ** maximum_audiodec_instances;
+
+fn validAudiodecType(codec_type: u32) bool {
+    return codec_type >= audiodec_type_atrac9 and codec_type <= audiodec_type_m4aac;
+}
+
+fn audiodecWordBytes(word_length: i32) ?u32 {
+    return switch (word_length) {
+        audiodec_word_16bit => 2,
+        audiodec_word_24bit, audiodec_word_float => 4,
+        else => null,
+    };
+}
+
+fn audiodecFlags(word_length: i32) ?u64 {
+    const encoding: u64 = switch (word_length) {
+        audiodec_word_16bit => 0,
+        audiodec_word_24bit => 1,
+        audiodec_word_float => 2,
+        else => return null,
+    };
+    return encoding << 7;
+}
+
+fn audiodecSampleRate(index: u32) u32 {
+    const rates = [_]u32{ 96_000, 88_200, 64_000, 48_000, 44_100, 32_000, 24_000, 22_050, 16_000, 12_000, 11_025, 8_000 };
+    return if (index < rates.len) rates[index] else 48_000;
+}
+
+fn validateAudiodecCtrl(ctrl: ?*AudiodecCtrl, codec_type: u32, decode: bool) i32 {
+    const control = ctrl orelse return audiodec_error_invalid_ctrl_pointer;
+    if (control.parameter == null) return audiodec_error_invalid_param_pointer;
+    if (control.bsi_info == null) return audiodec_error_invalid_bsi_info_pointer;
+    const au = control.au_info orelse return audiodec_error_invalid_au_info_pointer;
+    const pcm = control.pcm_item orelse return audiodec_error_invalid_pcm_item_pointer;
+    if (au.size != @sizeOf(AudiodecAuInfo)) return audiodec_error_invalid_au_info_size;
+    if (pcm.size != @sizeOf(AudiodecPcmItem)) return audiodec_error_invalid_pcm_item_size;
+    if (decode and au.address == null) return audiodec_error_invalid_au_pointer;
+    if (decode and pcm.address == null) return audiodec_error_invalid_pcm_pointer;
+
+    const word_length = switch (codec_type) {
+        audiodec_type_atrac9 => blk: {
+            const parameter: *const AudiodecParamAtrac9 = @ptrCast(@alignCast(control.parameter.?));
+            const info: *const AudiodecAtrac9Info = @ptrCast(@alignCast(control.bsi_info.?));
+            if (parameter.size != @sizeOf(AudiodecParamAtrac9)) return audiodec_error_invalid_param_size;
+            if (info.size != @sizeOf(AudiodecAtrac9Info)) return audiodec_error_invalid_bsi_info_size;
+            break :blk parameter.word_length;
+        },
+        audiodec_type_mp3 => blk: {
+            const parameter: *const AudiodecParamMp3 = @ptrCast(@alignCast(control.parameter.?));
+            const info: *const AudiodecMp3Info = @ptrCast(@alignCast(control.bsi_info.?));
+            if (parameter.size != @sizeOf(AudiodecParamMp3)) return audiodec_error_invalid_param_size;
+            if (info.size != @sizeOf(AudiodecMp3Info)) return audiodec_error_invalid_bsi_info_size;
+            break :blk parameter.word_length;
+        },
+        audiodec_type_m4aac => blk: {
+            const parameter: *const AudiodecParamM4aac = @ptrCast(@alignCast(control.parameter.?));
+            const info: *const AudiodecM4aacInfo = @ptrCast(@alignCast(control.bsi_info.?));
+            if (parameter.size < @sizeOf(AudiodecParamM4aac)) return audiodec_error_invalid_param_size;
+            if (info.size != @sizeOf(AudiodecM4aacInfo)) return audiodec_error_invalid_bsi_info_size;
+            break :blk parameter.word_length;
+        },
+        else => return audiodec_error_invalid_type,
+    };
+    if (audiodecWordBytes(word_length) == null) return audiodec_error_invalid_word_length;
+    if (decode and au.data_size == 0) return audiodec_error_invalid_au_size;
+    if (decode and pcm.data_size == 0) return audiodec_error_invalid_pcm_size;
+    return errno.ok;
+}
+
+fn fillAudiodecInfo(ctrl: *AudiodecCtrl, instance: *const LegacyAudiodec) void {
+    switch (instance.codec_type) {
+        audiodec_type_atrac9 => {
+            const output: *AudiodecAtrac9Info = @ptrCast(@alignCast(ctrl.bsi_info.?));
+            const info = instance.decoder.codecInfo();
+            output.channels = if (info.channels != 0) info.channels else instance.channels;
+            output.bitrate = info.bitrate;
+            output.sample_rate = if (info.sample_rate != 0) info.sample_rate else instance.sample_rate;
+            output.superframe_size = if (info.superframe_size != 0) info.superframe_size else instance.frame_bytes;
+            output.frames_in_superframe = if (info.frames_in_superframe != 0) info.frames_in_superframe else 1;
+            output.next_frame_size = if (info.next_frame_size != 0) info.next_frame_size else output.superframe_size;
+            output.frame_samples = if (info.frame_samples != 0) info.frame_samples else instance.frame_samples;
+            output.result = 0;
+        },
+        audiodec_type_mp3 => {
+            const output: *AudiodecMp3Info = @ptrCast(@alignCast(ctrl.bsi_info.?));
+            const info = instance.decoder.codecInfo();
+            output.header = info.mp3_header;
+            output.crc = 0;
+            output.mode = if (info.channels == 1) 3 else 0;
+            output.mode_extension = 0;
+            output.copyright = 0;
+            output.original = 0;
+            output.emphasis = 0;
+            output.reserved = .{ 0, 0 };
+            output.result = 0;
+        },
+        audiodec_type_m4aac => {
+            const output: *AudiodecM4aacInfo = @ptrCast(@alignCast(ctrl.bsi_info.?));
+            const info = instance.decoder.codecInfo();
+            output.sample_rate = if (info.sample_rate != 0) info.sample_rate else instance.sample_rate;
+            output.channels = if (info.channels != 0) info.channels else instance.channels;
+            output.heaac = info.heaac;
+            output.result = 0;
+        },
+        else => {},
+    }
+}
+
+fn audiodecInitLibrary(codec_type: u32) callconv(abi.guest) i32 {
+    if (!validAudiodecType(codec_type)) return audiodec_error_invalid_type;
+    audiodec_mutex.lock();
+    defer audiodec_mutex.unlock();
+    audiodec_init_count[codec_type] +|= 1;
+    return errno.ok;
+}
+
+fn audiodecTermLibrary(codec_type: u32) callconv(abi.guest) i32 {
+    if (!validAudiodecType(codec_type)) return audiodec_error_invalid_type;
+    audiodec_mutex.lock();
+    defer audiodec_mutex.unlock();
+    if (audiodec_init_count[codec_type] != 0) audiodec_init_count[codec_type] -= 1;
+    return errno.ok;
+}
+
+fn audiodecCreateDecoder(ctrl: ?*AudiodecCtrl, codec_type: u32) callconv(abi.guest) i32 {
+    if (!validAudiodecType(codec_type)) return audiodec_error_invalid_type;
+    const status = validateAudiodecCtrl(ctrl, codec_type, false);
+    if (status != errno.ok) return status;
+    const control = ctrl.?;
+
+    audiodec_mutex.lock();
+    defer audiodec_mutex.unlock();
+    if (audiodec_init_count[codec_type] == 0) return audiodec_error_argument;
+
+    for (&audiodec_instances, 0..) |*slot, index| {
+        if (slot.active) continue;
+        var instance = LegacyAudiodec{ .active = true, .codec_type = codec_type };
+        switch (codec_type) {
+            audiodec_type_atrac9 => {
+                const parameter: *const AudiodecParamAtrac9 = @ptrCast(@alignCast(control.parameter.?));
+                instance.word_length = parameter.word_length;
+                instance.frame_bytes = 2048;
+                instance.frame_samples = 256;
+                instance.decoder = ajm_codec.Decoder.create(ajm_codec.codec_atrac9, audiodecFlags(parameter.word_length).?) catch
+                    return audiodec_error_argument;
+                const initialized = instance.decoder.initialize(&parameter.config_data);
+                if (initialized.result != 0) {
+                    instance.decoder.deinit();
+                    return audiodec_error_argument;
+                }
+                const info = instance.decoder.codecInfo();
+                instance.channels = info.channels;
+                instance.sample_rate = info.sample_rate;
+                instance.frame_bytes = info.superframe_size;
+                instance.frame_samples = info.frame_samples;
+            },
+            audiodec_type_mp3 => {
+                const parameter: *const AudiodecParamMp3 = @ptrCast(@alignCast(control.parameter.?));
+                instance.word_length = parameter.word_length;
+                instance.decoder = ajm_codec.Decoder.create(ajm_codec.codec_mp3, audiodecFlags(parameter.word_length).?) catch
+                    return audiodec_error_argument;
+                _ = instance.decoder.initialize(&.{});
+            },
+            audiodec_type_m4aac => {
+                const parameter: *const AudiodecParamM4aac = @ptrCast(@alignCast(control.parameter.?));
+                instance.word_length = parameter.word_length;
+                instance.channels = @min(if (parameter.maximum_channels == 0) 2 else parameter.maximum_channels, 8);
+                instance.sample_rate = audiodecSampleRate(parameter.sample_rate_index);
+                instance.frame_bytes = 2048;
+                instance.frame_samples = 1024;
+                const flags = (audiodecFlags(parameter.word_length) orelse 0) |
+                    instance.channels |
+                    (if (parameter.enable_heaac != 0) @as(u64, 1) << 32 else 0);
+                instance.decoder = ajm_codec.Decoder.create(ajm_codec.codec_m4aac, flags) catch
+                    return audiodec_error_argument;
+                var init_bytes: [8]u8 = undefined;
+                std.mem.writeInt(u32, init_bytes[0..4], parameter.config_number, .little);
+                std.mem.writeInt(u32, init_bytes[4..8], parameter.sample_rate_index, .little);
+                const initialized = instance.decoder.initialize(&init_bytes);
+                if (initialized.result != 0) {
+                    instance.decoder.deinit();
+                    return audiodec_error_argument;
+                }
+                const info = instance.decoder.codecInfo();
+                if (info.channels != 0) instance.channels = info.channels;
+                if (info.sample_rate != 0) instance.sample_rate = info.sample_rate;
+                if (info.frame_samples != 0) instance.frame_samples = info.frame_samples;
+            },
+            else => unreachable,
+        }
+        slot.* = instance;
+        fillAudiodecInfo(control, slot);
+        std.debug.print(
+            "[audio audiodec] create handle={d} codec={s} format={d}\n",
+            .{ index + 1, if (codec_type == audiodec_type_mp3) "mp3" else if (codec_type == audiodec_type_atrac9) "atrac9" else "aac", instance.word_length },
+        );
+        return @intCast(index + 1);
+    }
+    return audiodec_error_argument;
+}
+
+fn audiodecDeleteDecoder(handle: i32) callconv(abi.guest) i32 {
+    if (handle <= 0 or handle > maximum_audiodec_instances) return audiodec_error_invalid_handle;
+    audiodec_mutex.lock();
+    defer audiodec_mutex.unlock();
+    const instance = &audiodec_instances[@intCast(handle - 1)];
+    if (!instance.active) return audiodec_error_invalid_handle;
+    instance.decoder.deinit();
+    instance.* = .{};
+    return errno.ok;
+}
+
+fn audiodecDecode(handle: i32, ctrl: ?*AudiodecCtrl) callconv(abi.guest) i32 {
+    if (handle <= 0 or handle > maximum_audiodec_instances) return audiodec_error_invalid_handle;
+    audiodec_mutex.lock();
+    defer audiodec_mutex.unlock();
+    const instance = &audiodec_instances[@intCast(handle - 1)];
+    if (!instance.active) return audiodec_error_invalid_handle;
+    const status = validateAudiodecCtrl(ctrl, instance.codec_type, true);
+    if (status != errno.ok) return status;
+    const control = ctrl.?;
+    const au = control.au_info.?;
+    const pcm = control.pcm_item.?;
+    const input = au.address.?[0..au.data_size];
+    const output = pcm.address.?[0..pcm.data_size];
+
+    const report = instance.decoder.decode(input, output);
+    au.data_size = @intCast(report.consumed);
+    pcm.data_size = @intCast(report.produced);
+    if (report.frames == 0 and report.consumed == 0) return audiodec_error_argument;
+    const info = instance.decoder.codecInfo();
+    if (info.channels != 0) instance.channels = info.channels;
+    if (info.sample_rate != 0) instance.sample_rate = info.sample_rate;
+    if (info.frame_samples != 0) instance.frame_samples = info.frame_samples;
+    fillAudiodecInfo(control, instance);
+    return errno.ok;
+}
+
+fn audiodecClearContext(handle: i32) callconv(abi.guest) i32 {
+    if (handle <= 0 or handle > maximum_audiodec_instances) return audiodec_error_invalid_handle;
+    audiodec_mutex.lock();
+    defer audiodec_mutex.unlock();
+    const instance = &audiodec_instances[@intCast(handle - 1)];
+    if (!instance.active) return audiodec_error_invalid_handle;
+    instance.decoder.reset();
+    return errno.ok;
+}
+
+const audiodec_exports = [_]symbols.Export{
+    .{ .name = "sceAudiodecInitLibrary", .function = trace.wrap("sceAudiodecInitLibrary", &audiodecInitLibrary), .expect_id = "VjhsmxpcezI" },
+    .{ .name = "sceAudiodecTermLibrary", .function = trace.wrap("sceAudiodecTermLibrary", &audiodecTermLibrary), .expect_id = "h5jSB2QIDV0" },
+    .{ .name = "sceAudiodecDeleteDecoder", .function = trace.wrap("sceAudiodecDeleteDecoder", &audiodecDeleteDecoder), .expect_id = "Tp+ZEy69mLk" },
+    .{ .name = "sceAudiodecDecode", .function = trace.wrap("sceAudiodecDecode", &audiodecDecode), .expect_id = "KHXHMDLkILw" },
+    .{ .name = "sceAudiodecClearContext", .function = trace.wrap("sceAudiodecClearContext", &audiodecClearContext), .expect_id = "6Vf9WTLDoss" },
+    .{ .name = "sceAudiodecCreateDecoder", .function = trace.wrap("sceAudiodecCreateDecoder", &audiodecCreateDecoder), .expect_id = "O3f1sLMWRvs" },
+};
+
+// libSceAcm ---------------------------------------------------------------
+
+const AcmBatchInfo = acm_convolution.BatchInfo;
+
+const AcmBatchError = extern struct {
+    reserved: [8]u32 = [_]u32{0} ** 8,
+};
+
+const maximum_acm_contexts = 32;
+var acm_mutex: Lock = .{};
+const AcmContext = struct {
+    active: bool = false,
+    runtime: acm_convolution.Runtime = .{},
+    completed: [128]u32 = [_]u32{0} ** 128,
+};
+var acm_contexts: [maximum_acm_contexts]AcmContext = @splat(.{});
+var next_acm_batch = std.atomic.Value(u32).init(1);
+
+fn acmContextIndex(context: u32) ?usize {
+    if (context == 0 or context > maximum_acm_contexts) return null;
+    return context - 1;
+}
+
+fn acmContextCreate(context: ?*u32) callconv(abi.guest) i32 {
+    const output = context orelse return errno.KernelError.einval.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    for (&acm_contexts, 0..) |*entry, index| {
+        if (entry.active) continue;
+        entry.active = true;
+        output.* = @intCast(index + 1);
+        return errno.ok;
+    }
+    return errno.KernelError.enomem.raw();
+}
+
+fn acmContextDestroy(context: u32) callconv(abi.guest) i32 {
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    if (!acm_contexts[index].active) return errno.KernelError.einval.raw();
+    acm_contexts[index].runtime.deinit();
+    acm_contexts[index] = .{};
+    return errno.ok;
+}
+
+fn acmBatchStartBuffers(
+    context: u32,
+    info_count: u32,
+    infos: ?[*]const ?*const AcmBatchInfo,
+    batch_error: ?*AcmBatchError,
+    batch: ?*u32,
+) callconv(abi.guest) i32 {
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    if (info_count > 256 or (info_count != 0 and infos == null)) return errno.KernelError.einval.raw();
+    if (info_count != 0 and !acmCheck(@intFromPtr(infos.?), @as(usize, info_count) * @sizeOf(usize))) return errno.KernelError.efault.raw();
+    if (batch == null or !acmCheck(@intFromPtr(batch.?), @sizeOf(u32))) return errno.KernelError.efault.raw();
+    if (batch_error != null and !acmCheck(@intFromPtr(batch_error.?), @sizeOf(AcmBatchError))) return errno.KernelError.efault.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    const entry = &acm_contexts[index];
+    if (!entry.active) return errno.KernelError.einval.raw();
+    if (batch_error) |failure| failure.* = .{};
+    for (0..info_count) |i| {
+        const info = infos.?[i] orelse return errno.KernelError.einval.raw();
+        if (!acmCheck(@intFromPtr(info), @sizeOf(AcmBatchInfo)) or info.offset > info.size) return errno.KernelError.einval.raw();
+        entry.runtime.execute(@intFromPtr(info.buffer), info.offset, acmCheck) catch |err| return acmBatchFailure(batch_error, err);
+    }
+    acmComplete(entry, batch.?);
+    return errno.ok;
+}
+
+fn acmBatchStartBuffer(
+    context: u32,
+    commands_address: u64,
+    commands_size: usize,
+    batch_error: ?*AcmBatchError,
+    batch: ?*u32,
+) callconv(abi.guest) i32 {
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    if (batch == null or !acmCheck(@intFromPtr(batch.?), @sizeOf(u32))) return errno.KernelError.efault.raw();
+    if (batch_error != null and !acmCheck(@intFromPtr(batch_error.?), @sizeOf(AcmBatchError))) return errno.KernelError.efault.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    const entry = &acm_contexts[index];
+    if (!entry.active) return errno.KernelError.einval.raw();
+    if (batch_error) |failure| failure.* = .{};
+    entry.runtime.execute(commands_address, commands_size, acmCheck) catch |err| return acmBatchFailure(batch_error, err);
+    acmComplete(entry, batch.?);
+    return errno.ok;
+}
+
+fn acmBatchInitialize(_: ?*anyopaque, _: usize, _: ?*anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchInitializeLite(_: ?*anyopaque, _: usize, _: ?*anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchStart(_: u32, _: ?*anyopaque, _: ?*anyopaque, _: ?*u32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchStartMultiple(_: u32, _: u32, _: ?*anyopaque, _: ?*anyopaque, _: ?*u32) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchProcess(_: ?*anyopaque) callconv(abi.guest) i32 {
+    return errno.ok;
+}
+
+fn acmBatchWait(context: u32, batch: u32, _: u32) callconv(abi.guest) i32 {
+    const index = acmContextIndex(context) orelse return errno.KernelError.einval.raw();
+    acm_mutex.lock();
+    defer acm_mutex.unlock();
+    const entry = &acm_contexts[index];
+    // FMOD deliberately waits on -1 before submitting its first job. Reporting
+    // success makes it mix a not-yet-written wet buffer into the entire graph.
+    return if (entry.active and batch != 0 and entry.completed[batch % entry.completed.len] == batch) errno.ok else errno.KernelError.einval.raw();
+}
+
+fn acmCheck(address: usize, bytes: usize) bool {
+    return kernel_memory.isGuestRangeAccessible(address, bytes);
+}
+
+fn acmStatus(err: acm_convolution.Error) i32 {
+    return switch (err) {
+        error.OutOfMemory => errno.KernelError.enomem.raw(),
+        error.Unsupported => errno.KernelError.enosys.raw(),
+        error.InvalidParameter => errno.KernelError.einval.raw(),
+    };
+}
+
+fn acmBatchFailure(output: ?*AcmBatchError, err: acm_convolution.Error) i32 {
+    const status = acmStatus(err);
+    if (output) |failure| failure.reserved[0] = @bitCast(status);
+    std.debug.print("[audio acm] batch failed: {s}\n", .{@errorName(err)});
+    return status;
+}
+
+fn acmComplete(entry: *AcmContext, output: *u32) void {
+    const id = next_acm_batch.fetchAdd(1, .monotonic);
+    entry.completed[id % entry.completed.len] = id;
+    output.* = id;
+    if (id <= 4) std.debug.print("[audio acm] completed convolution batch #{d}\n", .{id});
+}
+
+fn acmBatchJobNotification(info: ?*AcmBatchInfo, _: u64, _: u64) callconv(abi.guest) i32 {
+    acm_convolution.notification(@intFromPtr(info), acmCheck) catch |err| return acmStatus(err);
+    return errno.ok;
+}
+
+fn acmConvReverbSharedInput(info: ?*AcmBatchInfo, blocks: u32, input: usize, count: u32, irs: usize, gains: usize, outputs: usize) callconv(abi.guest) i32 {
+    acm_convolution.append(@intFromPtr(info), blocks, input, count, irs, gains, outputs, false, acmCheck) catch |err| return acmStatus(err);
+    return errno.ok;
+}
+
+fn acmConvReverbSharedIr(info: ?*AcmBatchInfo, blocks: u32, ir: usize, count: u32, inputs: usize, gains: usize, outputs: usize) callconv(abi.guest) i32 {
+    acm_convolution.append(@intFromPtr(info), blocks, ir, count, inputs, gains, outputs, true, acmCheck) catch |err| return acmStatus(err);
+    return errno.ok;
+}
+
+fn acmFft(_: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
+}
+
+fn acmIfft(_: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
+}
+
+fn acmPanner(_: ?*AcmBatchInfo, _: u64, _: u64, _: u64, _: u64, _: u64) callconv(abi.guest) i32 {
+    return errno.KernelError.enosys.raw();
+}
+
+const acm_exports = [_]symbols.Export{
+    .{ .name = "sceAcmContextCreate", .function = trace.wrap("sceAcmContextCreate", &acmContextCreate), .expect_id = "ZIXln2K3XMk" },
+    .{ .name = "sceAcmContextDestroy", .function = trace.wrap("sceAcmContextDestroy", &acmContextDestroy), .expect_id = "jBgBjAj02R8" },
+    .{ .name = "sceAcmBatchStartBuffer", .function = trace.wrap("sceAcmBatchStartBuffer", &acmBatchStartBuffer), .expect_id = "tW9W+CAG4FE" },
+    .{ .name = "sceAcmBatchStartBuffers", .function = trace.wrap("sceAcmBatchStartBuffers", &acmBatchStartBuffers), .expect_id = "8fe55ktlNVo" },
+    .{ .name = "sceAcmBatchInitialize", .function = trace.wrap("sceAcmBatchInitialize", &acmBatchInitialize), .expect_id = "WeZOIm8+8WI" },
+    .{ .name = "sceAcmBatchInitializeLite", .function = trace.wrap("sceAcmBatchInitializeLite", &acmBatchInitializeLite), .expect_id = "Mk1xvQXIdkk" },
+    .{ .name = "sceAcmBatchStart", .function = trace.wrap("sceAcmBatchStart", &acmBatchStart), .expect_id = "A5NXCXK5Gfc" },
+    .{ .name = "sceAcmBatchStartMultiple", .function = trace.wrap("sceAcmBatchStartMultiple", &acmBatchStartMultiple), .expect_id = "S3BPrjCfZ90" },
+    .{ .name = "sceAcmBatchProcess", .function = trace.wrap("sceAcmBatchProcess", &acmBatchProcess), .expect_id = "uqDIauipRbo" },
+    .{ .name = "sceAcmBatchJobNotification", .function = trace.wrap("sceAcmBatchJobNotification", &acmBatchJobNotification), .expect_id = "r7z5YQFZo+U" },
+    .{ .name = "sceAcmBatchWait", .function = trace.wrap("sceAcmBatchWait", &acmBatchWait), .expect_id = "RLN3gRlXJLE" },
+    .{ .name = "sceAcm_ConvReverb_SharedInput", .function = trace.wrap("sceAcm_ConvReverb_SharedInput", &acmConvReverbSharedInput), .expect_id = "u70oWo92SYQ" },
+    .{ .name = "sceAcm_ConvReverb_SharedIr", .function = trace.wrap("sceAcm_ConvReverb_SharedIr", &acmConvReverbSharedIr), .expect_id = "9nLbWmRDpa8" },
+    .{ .name = "sceAcm_FFT", .function = trace.wrap("sceAcm_FFT", &acmFft), .expect_id = "KovqaFbmtsM" },
+    .{ .name = "sceAcm_IFFT", .function = trace.wrap("sceAcm_IFFT", &acmIfft), .expect_id = "DR-ZCmvVR9Q" },
+    .{ .name = "sceAcm_Panner", .function = trace.wrap("sceAcm_Panner", &acmPanner), .expect_id = "LA4RCNKnFjg" },
+};
+
+// libSceAjm ---------------------------------------------------------------
+
+const AjmBatchInfo = extern struct {
+    buffer: ?[*]u8 = null,
+    offset: usize = 0,
+    size: usize = 0,
+    last_good_job: ?[*]u8 = null,
+    last_good_job_return_address: ?*const anyopaque = null,
+};
+
+const AjmBatchError = extern struct {
+    error_code: i32 = 0,
+    padding1: u32 = 0,
+    job_address: ?*const anyopaque = null,
+    command_offset: u32 = 0,
+    padding2: u32 = 0,
+    job_return_address: ?*const anyopaque = null,
+};
+
+const AjmDecodeResult = extern struct {
+    result: i32 = 0,
+    internal_result: i32 = 0,
+    size_consumed: i32 = 0,
+    size_produced: i32 = 0,
+    total_decoded_samples: u64 = 0,
+    number_of_frames: u32 = 0,
+    reserved: u32 = 0,
+};
+
+const AjmBuffer = extern struct {
+    address: ?[*]u8 = null,
+    size: usize = 0,
+};
+
+const AjmInstance = struct {
+    active: bool = false,
+    context: u32 = 0,
+    codec: u32 = 0,
+    flags: u64 = 0,
+    id: u32 = 0,
+    decoder: ajm_codec.Decoder = .{},
+};
+
+const maximum_ajm_contexts = 16;
+const maximum_ajm_codecs = 64;
+const maximum_ajm_instances = 64;
+var ajm_mutex: Lock = .{};
+var ajm_contexts: [maximum_ajm_contexts]bool = [_]bool{false} ** maximum_ajm_contexts;
+var ajm_modules: [maximum_ajm_contexts][maximum_ajm_codecs]bool = [_][maximum_ajm_codecs]bool{[_]bool{false} ** maximum_ajm_codecs} ** maximum_ajm_contexts;
+var ajm_instances: [maximum_ajm_instances]AjmInstance = [_]AjmInstance{.{}} ** maximum_ajm_instances;
+var next_batch = std.atomic.Value(u32).init(1);
+var ajm_decode_jobs = std.atomic.Value(u64).init(0);
+
+const ajm_flag_control_reset: u64 = 1 << 13;
+const ajm_flag_control_initialize: u64 = 1 << 14;
+const ajm_flag_sideband_gapless: u64 = 1 << 45;
+
+fn ajmContextIndex(context: u32) ?usize {
+    if (context == 0 or context > maximum_ajm_contexts) return null;
+    return context - 1;
+}
+
+fn isAjmContext(context: u32) bool {
+    const index = ajmContextIndex(context) orelse return false;
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    return ajm_contexts[index];
+}
+
+fn isAjmInstance(instance: u32) bool {
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    for (ajm_instances) |candidate| if (candidate.active and candidate.id == instance) return true;
+    return false;
+}
+
+fn findAjmInstanceLocked(instance: u32) ?*AjmInstance {
+    for (&ajm_instances) |*candidate| {
+        if (candidate.active and candidate.id == instance) return candidate;
+    }
+    return null;
+}
+
+fn ajmInitialize(reserved: i64, context: ?*u32) callconv(abi.guest) i32 {
+    // Newer Prospero middleware passes generation/feature bits here even
+    // though older SDK headers called the field reserved. Accept these flags
+    // without rejecting initialization merely because the value is nonzero.
+    _ = reserved;
+    const output = context orelse return ajm_error_invalid_parameter;
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    for (&ajm_contexts, 0..) |*active, index| {
+        if (active.*) continue;
+        active.* = true;
+        output.* = @intCast(index + 1);
+        std.debug.print("[audio ajm] initialize ctx={d}\n", .{index + 1});
+        return errno.ok;
+    }
+    return ajm_error_invalid_parameter;
+}
+
+fn ajmFinalize(context: u32) callconv(abi.guest) i32 {
+    const index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    if (!ajm_contexts[index]) return ajm_error_invalid_context;
+    ajm_contexts[index] = false;
+    ajm_modules[index] = [_]bool{false} ** maximum_ajm_codecs;
+    for (&ajm_instances) |*instance| if (instance.active and instance.context == context) {
+        instance.decoder.deinit();
+        instance.* = .{};
+    };
+    return errno.ok;
+}
+
+fn ajmModuleRegister(context: u32, codec: u32, reserved: i64) callconv(abi.guest) i32 {
+    _ = reserved;
+    const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
+    if (!ajm_codec.isSupported(codec)) return ajm_error_codec_not_supported;
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
+    ajm_modules[context_index][codec] = true;
+    std.debug.print("[audio ajm] module register ctx={d} codec={d}\n", .{ context, codec });
+    return errno.ok;
+}
+
+fn ajmModuleUnregister(context: u32, codec: u32) callconv(abi.guest) i32 {
+    const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
+    if (codec >= maximum_ajm_codecs) return ajm_error_codec_not_supported;
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
+    ajm_modules[context_index][codec] = false;
+    return errno.ok;
+}
+
+fn ajmInstanceCreate(context: u32, codec: u32, flags: u64, instance: ?*u32) callconv(abi.guest) i32 {
+    const output = instance orelse return ajm_error_invalid_parameter;
+    const context_index = ajmContextIndex(context) orelse return ajm_error_invalid_context;
+    if (!ajm_codec.isSupported(codec)) return ajm_error_codec_not_supported;
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    if (!ajm_contexts[context_index]) return ajm_error_invalid_context;
+    if (!ajm_modules[context_index][codec]) return ajm_error_codec_not_supported;
+    var decoder = ajm_codec.Decoder.create(codec, flags) catch return ajm_error_codec_not_supported;
+    for (&ajm_instances, 0..) |*candidate, index| {
+        if (candidate.active) continue;
+        const id = (codec << 14) | @as(u32, @intCast(index + 1));
+        candidate.* = .{ .active = true, .context = context, .codec = codec, .flags = flags, .id = id, .decoder = decoder };
+        output.* = id;
+        std.debug.print(
+            "[audio ajm] instance={d} codec={s} flags=0x{x} format={d} channels={d}\n",
+            .{ id, ajm_codec.codecName(codec), flags, (flags >> 7) & 7, flags & 0x7f },
+        );
+        return errno.ok;
+    }
+    decoder.deinit();
+    return ajm_error_invalid_parameter;
+}
+
+fn ajmInstanceDestroy(context: u32, instance: u32) callconv(abi.guest) i32 {
+    if (!isAjmContext(context)) return ajm_error_invalid_context;
+    ajm_mutex.lock();
+    defer ajm_mutex.unlock();
+    for (&ajm_instances) |*candidate| {
+        if (!candidate.active or candidate.id != instance or candidate.context != context) continue;
+        candidate.decoder.deinit();
+        candidate.* = .{};
+        return errno.ok;
+    }
+    return ajm_error_invalid_parameter;
+}
+
+fn ajmMemoryRegister(context: u32, address: ?*anyopaque, pages: usize) callconv(abi.guest) i32 {
+    if (!isAjmContext(context)) return ajm_error_invalid_context;
+    if (address == null or pages == 0) return ajm_error_invalid_parameter;
+    // AJM consumes the same mapped guest address space as the CPU decoder, so
+    // no second host registration is required.
+    return errno.ok;
+}
+
+fn ajmMemoryUnregister(context: u32, address: ?*anyopaque) callconv(abi.guest) i32 {
+    if (!isAjmContext(context)) return ajm_error_invalid_context;
+    return if (address != null) errno.ok else ajm_error_invalid_parameter;
+}
+
+fn ajmBatchInitialize(buffer: ?[*]u8, size: usize, info: ?*AjmBatchInfo) callconv(abi.guest) i32 {
+    if (buffer == null or size == 0 or info == null) return ajm_error_invalid_parameter;
+    info.?.* = .{ .buffer = buffer, .size = size };
+    return errno.ok;
+}
+
+fn appendAjmJob(info: ?*AjmBatchInfo, size: usize) i32 {
+    const batch = info orelse return ajm_error_invalid_parameter;
+    const buffer = batch.buffer orelse return ajm_error_invalid_parameter;
+    if (batch.offset > batch.size or size > batch.size - batch.offset) return ajm_error_job_creation;
+    const start = batch.offset;
+    batch.offset += size;
+    @memset(buffer[start..batch.offset], 0);
+    batch.last_good_job = buffer + start;
+    batch.last_good_job_return_address = null;
+    return errno.ok;
+}
+
+fn ajmBatchStart(context: u32, info: ?*const AjmBatchInfo, _: i32, batch_error: ?*AjmBatchError, batch: ?*u32) callconv(abi.guest) i32 {
+    if (!isAjmContext(context)) return ajm_error_invalid_context;
+    if (info == null or batch == null) return ajm_error_invalid_parameter;
+    if (batch_error) |output| output.* = .{};
+    batch.?.* = next_batch.fetchAdd(1, .monotonic);
+    return errno.ok;
+}
+
+fn ajmBatchWait(context: u32, _: u32, _: u32, batch_error: ?*AjmBatchError) callconv(abi.guest) i32 {
+    if (!isAjmContext(context)) return ajm_error_invalid_context;
+    if (batch_error) |output| output.* = .{};
+    return errno.ok;
+}
+
+fn ajmBatchCancel(context: u32, _: u32) callconv(abi.guest) i32 {
+    return if (isAjmContext(context)) errno.ok else ajm_error_invalid_context;
+}
+
+fn ajmBatchErrorDump(info: ?*const AjmBatchInfo, batch_error: ?*AjmBatchError) callconv(abi.guest) i32 {
+    if (info == null) return ajm_error_invalid_parameter;
+    if (batch_error) |output| output.* = .{};
+    return errno.ok;
+}
+
+fn zeroAjmResult(result: ?[*]u8, size: usize, valid_instance: bool) void {
+    const output = result orelse return;
+    @memset(output[0..size], 0);
+    if (!valid_instance and size >= @sizeOf(i32)) {
+        const code: i32 = ajm_result_invalid_parameter;
+        @memcpy(output[0..@sizeOf(i32)], std.mem.asBytes(&code));
+    }
+}
+
+fn writeAjmBasicResult(result: ?[*]u8, code: i32, internal: i32) void {
+    const output = result orelse return;
+    @memcpy(output[0..4], std.mem.asBytes(&code));
+    @memcpy(output[4..8], std.mem.asBytes(&internal));
+}
+
+fn ajmBatchJobInitialize(info: ?*AjmBatchInfo, instance: u32, parameters: ?*const anyopaque, parameter_size: usize, result: ?[*]u8) callconv(abi.guest) i32 {
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        const input: []const u8 = if (parameters) |address|
+            @as([*]const u8, @ptrCast(address))[0..@min(parameter_size, 4096)]
+        else
+            &.{};
+        decoded = candidate.decoder.initialize(input);
+        const codec_info = candidate.decoder.codecInfo();
+        std.debug.print(
+            "[audio ajm] initialized instance={d} result=0x{x} {d}Hz ch={d} frame={d} superframe={d}\n",
+            .{ instance, @as(u32, @bitCast(decoded.result)), codec_info.sample_rate, codec_info.channels, codec_info.frame_samples, codec_info.superframe_size },
+        );
+    }
+    ajm_mutex.unlock();
+    writeAjmBasicResult(result, decoded.result, decoded.internal_result);
+    return appendAjmJob(info, 48);
+}
+
+fn ajmBatchJobGetCodecInfo(info: ?*AjmBatchInfo, instance: u32, result: ?[*]u8, result_size: usize) callconv(abi.guest) i32 {
+    const output_size = @min(result_size, 4096);
+    if (result) |output| @memset(output[0..output_size], 0);
+    var valid = false;
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        valid = true;
+        const codec_info = candidate.decoder.codecInfo();
+        if (result) |output| {
+            if (candidate.codec == ajm_codec.codec_atrac9 and output_size >= 24) {
+                std.mem.writeInt(u32, output[8..12], codec_info.superframe_size, .little);
+                std.mem.writeInt(u32, output[12..16], codec_info.frames_in_superframe, .little);
+                std.mem.writeInt(u32, output[16..20], codec_info.next_frame_size, .little);
+                std.mem.writeInt(u32, output[20..24], codec_info.frame_samples, .little);
+            } else if (candidate.codec == ajm_codec.codec_mp3 and output_size >= 24) {
+                std.mem.writeInt(u32, output[8..12], codec_info.mp3_header, .little);
+                const header = @byteSwap(codec_info.mp3_header);
+                output[12] = @intFromBool(header & 0x0001_0000 == 0);
+                output[13] = @truncate((header >> 6) & 3);
+                output[14] = @truncate((header >> 4) & 3);
+                output[15] = @truncate((header >> 3) & 1);
+                output[16] = @truncate((header >> 2) & 1);
+                output[17] = @truncate(header & 3);
+            } else if (candidate.codec == ajm_codec.codec_m4aac and output_size >= 16) {
+                std.mem.writeInt(u32, output[8..12], codec_info.heaac, .little);
+                std.mem.writeInt(u32, output[12..16], 0, .little);
+            } else if (candidate.codec == ajm_codec.codec_opus and output_size >= 12) {
+                std.mem.writeInt(u32, output[8..12], codec_info.frames_per_packet, .little);
+            }
+        }
+    }
+    ajm_mutex.unlock();
+    if (result != null and output_size >= 8) writeAjmBasicResult(result, if (valid) 0 else ajm_result_invalid_parameter, 0);
+    return appendAjmJob(info, 64);
+}
+
+fn ajmBatchJobSetGaplessDecode(info: ?*AjmBatchInfo, instance: u32, parameters: ?*const anyopaque, parameter_size: i32, result: ?[*]u8) callconv(abi.guest) i32 {
+    _ = parameter_size;
+    var code: i32 = ajm_result_invalid_parameter;
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        if (parameters != null) {
+            const bytes = @as([*]const u8, @ptrCast(parameters.?))[0..8];
+            candidate.decoder.setGapless(std.mem.readInt(u32, bytes[0..4], .little), std.mem.readInt(u16, bytes[4..6], .little));
+            code = 0;
+        }
+    }
+    ajm_mutex.unlock();
+    writeAjmBasicResult(result, code, 0);
+    return appendAjmJob(info, 48);
+}
+
+fn setAjmDecodeResult(result: ?*AjmDecodeResult, decoded: ajm_codec.Report) void {
+    const output = result orelse return;
+    output.* = .{
+        .result = decoded.result,
+        .internal_result = decoded.internal_result,
+        .size_consumed = std.math.cast(i32, decoded.consumed) orelse std.math.maxInt(i32),
+        .size_produced = std.math.cast(i32, decoded.produced) orelse std.math.maxInt(i32),
+        .total_decoded_samples = decoded.total_samples,
+        .number_of_frames = decoded.frames,
+    };
+}
+
+fn ajmBatchJobDecode(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    input: ?*const anyopaque,
+    input_size: usize,
+    pcm: ?[*]u8,
+    pcm_size: usize,
+    result: ?*AjmDecodeResult,
+) callconv(abi.guest) i32 {
+    const bounded_input_size = @min(input_size, 64 * 1024 * 1024);
+    const bounded_pcm_size = @min(pcm_size, 64 * 1024 * 1024);
+    if (pcm) |output| @memset(output[0..bounded_pcm_size], 0);
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    if ((input != null or bounded_input_size == 0) and (pcm != null or bounded_pcm_size == 0)) {
+        const input_bytes: []const u8 = if (input) |address| @as([*]const u8, @ptrCast(address))[0..bounded_input_size] else &.{};
+        const output_bytes: []u8 = if (pcm) |address| address[0..bounded_pcm_size] else &.{};
+        ajm_mutex.lock();
+        if (findAjmInstanceLocked(instance)) |candidate| decoded = candidate.decoder.decode(input_bytes, output_bytes);
+        ajm_mutex.unlock();
+    }
+    setAjmDecodeResult(result, decoded);
+    const job_number = ajm_decode_jobs.fetchAdd(1, .monotonic) + 1;
+    if (job_number <= 6 or (decoded.result != 0 and std.math.isPowerOfTwo(job_number))) {
+        std.debug.print(
+            "[audio ajm] decode #{d} instance={d} in={d}/{d} pcm={d}/{d} frames={d} result=0x{x}\n",
+            .{ job_number, instance, decoded.consumed, bounded_input_size, decoded.produced, bounded_pcm_size, decoded.frames, @as(u32, @bitCast(decoded.result)) },
+        );
+    }
+    return appendAjmJob(info, 64);
+}
+
+fn ajmBatchJobDecodeSplit(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    input_buffers: ?[*]const AjmBuffer,
+    input_count: usize,
+    output_buffers: ?[*]const AjmBuffer,
+    output_count: usize,
+    result: ?*AjmDecodeResult,
+) callconv(abi.guest) i32 {
+    const maximum_buffers: usize = 4096;
+    const maximum_bytes: usize = 64 * 1024 * 1024;
+    const safe_input_count = @min(input_count, maximum_buffers);
+    const safe_output_count = @min(output_count, maximum_buffers);
+    var input_bytes: usize = 0;
+    var output_bytes: usize = 0;
+    var buffers_valid = input_count == safe_input_count and output_count == safe_output_count;
+    if (safe_input_count != 0 and input_buffers == null) buffers_valid = false;
+    if (safe_output_count != 0 and output_buffers == null) buffers_valid = false;
+    if (input_buffers) |buffers| for (buffers[0..safe_input_count]) |buffer| {
+        if (buffer.size != 0 and buffer.address == null) buffers_valid = false;
+        input_bytes = std.math.add(usize, input_bytes, buffer.size) catch {
+            buffers_valid = false;
+            break;
+        };
+        if (input_bytes > maximum_bytes) buffers_valid = false;
+    };
+    if (output_buffers) |buffers| for (buffers[0..safe_output_count]) |buffer| {
+        if (buffer.size != 0 and buffer.address == null) buffers_valid = false;
+        output_bytes = std.math.add(usize, output_bytes, buffer.size) catch {
+            buffers_valid = false;
+            break;
+        };
+        if (output_bytes > maximum_bytes) buffers_valid = false;
+        if (buffer.address) |address| @memset(address[0..@min(buffer.size, maximum_bytes)], 0);
+    };
+
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    if (buffers_valid) decode: {
+        const joined_input = std.heap.page_allocator.alloc(u8, input_bytes) catch break :decode;
+        defer std.heap.page_allocator.free(joined_input);
+        const joined_output = std.heap.page_allocator.alloc(u8, output_bytes) catch break :decode;
+        defer std.heap.page_allocator.free(joined_output);
+        @memset(joined_output, 0);
+        var offset: usize = 0;
+        if (input_buffers) |buffers| for (buffers[0..safe_input_count]) |buffer| {
+            if (buffer.address) |address| @memcpy(joined_input[offset..][0..buffer.size], address[0..buffer.size]);
+            offset += buffer.size;
+        };
+        ajm_mutex.lock();
+        if (findAjmInstanceLocked(instance)) |candidate| decoded = candidate.decoder.decode(joined_input, joined_output);
+        ajm_mutex.unlock();
+
+        offset = 0;
+        if (output_buffers) |buffers| for (buffers[0..safe_output_count]) |buffer| {
+            const copied = @min(buffer.size, decoded.produced -| offset);
+            if (buffer.address) |address| @memcpy(address[0..copied], joined_output[offset..][0..copied]);
+            offset += copied;
+        };
+    }
+    setAjmDecodeResult(result, decoded);
+    const buffer_count = std.math.add(usize, input_count, output_count) catch return ajm_error_job_creation;
+    const buffer_bytes = std.math.mul(usize, buffer_count, 16) catch return ajm_error_job_creation;
+    const job_size = std.math.add(usize, buffer_bytes, 32) catch return ajm_error_job_creation;
+    return appendAjmJob(info, job_size);
+}
+
+fn ajmBatchJobSetResampleParameters(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    _: f32,
+    _: u32,
+    result: ?[*]u8,
+) callconv(abi.guest) i32 {
+    writeAjmBasicResult(result, if (isAjmInstance(instance)) ajm_codec.result_unsupported_flag else ajm_result_invalid_parameter, 0);
+    return appendAjmJob(info, 72);
+}
+
+fn ajmBatchJobSetResampleParametersEx(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    _: f32,
+    _: f32,
+    _: u32,
+    result: ?[*]u8,
+) callconv(abi.guest) i32 {
+    writeAjmBasicResult(result, if (isAjmInstance(instance)) ajm_codec.result_unsupported_flag else ajm_result_invalid_parameter, 0);
+    return appendAjmJob(info, 72);
+}
+
+fn ajmBatchJobGetResampleInfo(info: ?*AjmBatchInfo, instance: u32, result: ?[*]u8) callconv(abi.guest) i32 {
+    zeroAjmResult(result, 48, isAjmInstance(instance));
+    if (result) |output| {
+        var unity: f32 = 1.0;
+        @memcpy(output[8..12], std.mem.asBytes(&unity));
+    }
+    return appendAjmJob(info, 64);
+}
+
+fn ajmBatchJobGetStatistics(info: ?*AjmBatchInfo, _: f32, result: ?[*]u8) callconv(abi.guest) i32 {
+    if (result) |output| @memset(output[0..48], 0);
+    return appendAjmJob(info, 88);
+}
+
+fn ajmBatchJobControl(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    flags: u64,
+    sideband_input: ?*const anyopaque,
+    sideband_input_size: usize,
+    sideband_output: ?[*]u8,
+    sideband_output_size: usize,
+) callconv(abi.guest) i32 {
+    var decoded = ajm_codec.Report{ .result = ajm_result_invalid_parameter };
+    var codec_info = ajm_codec.CodecInfo{};
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        decoded = .{};
+        if (flags & ajm_flag_control_reset != 0) candidate.decoder.reset();
+
+        if (flags & ajm_flag_control_initialize != 0) {
+            const bounded_size = @min(sideband_input_size, 4096);
+            const input: []const u8 = if (sideband_input) |address|
+                @as([*]const u8, @ptrCast(address))[0..bounded_size]
+            else
+                &.{};
+
+            // Gen5 Scream streams combine GaplessDecode (8 bytes) and the
+            // codec initialization block in one Control job.  The title also
+            // passes input+8 to sceAjmDecAt9ParseConfigData, confirming that
+            // the ATRAC9 config begins after the gapless block.
+            const initialize_input = if (candidate.codec == ajm_codec.codec_atrac9 and
+                flags & ajm_flag_sideband_gapless != 0 and input.len >= 12)
+                input[8..]
+            else
+                input;
+            decoded = candidate.decoder.initialize(initialize_input);
+
+            if (candidate.codec == ajm_codec.codec_atrac9 and
+                flags & ajm_flag_sideband_gapless != 0 and input.len >= 8)
+            {
+                candidate.decoder.setGapless(
+                    std.mem.readInt(u32, input[0..4], .little),
+                    std.mem.readInt(u16, input[4..6], .little),
+                );
+            }
+        }
+        codec_info = candidate.decoder.codecInfo();
+    }
+    ajm_mutex.unlock();
+
+    if (sideband_output) |output| {
+        const bounded = @min(sideband_output_size, 4096);
+        @memset(output[0..bounded], 0);
+        if (bounded >= 8) writeAjmBasicResult(output, decoded.result, decoded.internal_result);
+    }
+    std.debug.print(
+        "[audio ajm] control instance={d} flags=0x{x} input={d} result=0x{x} {d}Hz ch={d} frame={d} superframe={d}\n",
+        .{ instance, flags, sideband_input_size, @as(u32, @bitCast(decoded.result)), codec_info.sample_rate, codec_info.channels, codec_info.frame_samples, codec_info.superframe_size },
+    );
+    return appendAjmJob(info, 48);
+}
+
+fn ajmBatchJobRunSplit(
+    info: ?*AjmBatchInfo,
+    instance: u32,
+    flags: u64,
+    input_buffers: ?[*]const AjmBuffer,
+    input_count: usize,
+    output_buffers: ?[*]const AjmBuffer,
+    output_count: usize,
+    sideband_output: ?[*]u8,
+    sideband_output_size: usize,
+) callconv(abi.guest) i32 {
+    var result = AjmDecodeResult{};
+    const status = ajmBatchJobDecodeSplit(
+        info,
+        instance,
+        input_buffers,
+        input_count,
+        output_buffers,
+        output_count,
+        &result,
+    );
+    if (sideband_output) |output| {
+        const bounded = @min(sideband_output_size, 4096);
+        @memset(output[0..bounded], 0);
+        const copied = @min(bounded, @sizeOf(AjmDecodeResult));
+        @memcpy(output[0..copied], std.mem.asBytes(&result)[0..copied]);
+    }
+    const job_number = ajm_decode_jobs.fetchAdd(1, .monotonic) + 1;
+    if (job_number <= 8 or (result.result != 0 and std.math.isPowerOfTwo(job_number))) {
+        std.debug.print(
+            "[audio ajm] run-split #{d} instance={d} flags=0x{x} buffers={d}/{d} consumed={d} produced={d} frames={d} result=0x{x}\n",
+            .{ job_number, instance, flags, input_count, output_count, result.size_consumed, result.size_produced, result.number_of_frames, @as(u32, @bitCast(result.result)) },
+        );
+    }
+    return status;
+}
+
+const AjmDecAt9ConfigDataInfo = extern struct {
+    channels: u32,
+    sample_rate: u32,
+    frame_samples_per_channel: u32,
+    superframe_samples_per_channel: u32,
+    superframe_size: u32,
+};
+
+fn ajmDecAt9ParseConfigData(
+    config_data: ?*const [4]u8,
+    output: ?*AjmDecAt9ConfigDataInfo,
+) callconv(abi.guest) i32 {
+    const config = config_data orelse return ajm_error_invalid_parameter;
+    const info_output = output orelse return ajm_error_invalid_parameter;
+    var decoder = ajm_codec.Decoder.create(ajm_codec.codec_atrac9, 0) catch
+        return ajm_error_invalid_parameter;
+    defer decoder.deinit();
+    const report = decoder.initialize(config);
+    if (report.result != 0) return ajm_error_invalid_parameter;
+    const info = decoder.codecInfo();
+    info_output.* = .{
+        .channels = info.channels,
+        .sample_rate = info.sample_rate,
+        .frame_samples_per_channel = info.frame_samples,
+        .superframe_samples_per_channel = info.frame_samples * info.frames_in_superframe,
+        .superframe_size = info.superframe_size,
+    };
+    return errno.ok;
+}
+
+fn ajmDecMp3ParseFrame(
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+    _: u64,
+) callconv(abi.guest) i32 {
+    // The SDK 11 metadata probe is optional; streamed MP3 data is decoded by
+    // the stateful Run/RunSplit path once an instance is created.
+    return errno.ok;
+}
+
+fn ajmStrError(_: i32) callconv(abi.guest) ?[*:0]const u8 {
+    return "ok";
+}
+
+fn ajmBatchJobClearContext(info: ?*AjmBatchInfo, instance: u32, result: ?[*]u8) callconv(abi.guest) i32 {
+    var status: i32 = ajm_result_invalid_parameter;
+    ajm_mutex.lock();
+    if (findAjmInstanceLocked(instance)) |candidate| {
+        candidate.decoder.reset();
+        status = 0;
+    }
+    ajm_mutex.unlock();
+    writeAjmBasicResult(result, status, 0);
+    return appendAjmJob(info, 48);
+}
+
+const ajm_exports = [_]symbols.Export{
+    .{ .name = "sceAjmInitialize", .function = trace.wrap("sceAjmInitialize", &ajmInitialize), .expect_id = "dl+4eHSzUu4" },
+    .{ .name = "sceAjmFinalize", .function = trace.wrap("sceAjmFinalize", &ajmFinalize), .expect_id = "MHur6qCsUus" },
+    .{ .name = "sceAjmStrError", .function = trace.wrap("sceAjmStrError", &ajmStrError), .expect_id = "AxhcqVv5AYU" },
+    .{ .name = "sceAjmModuleRegister", .function = trace.wrap("sceAjmModuleRegister", &ajmModuleRegister), .expect_id = "Q3dyFuwGn64" },
+    .{ .name = "sceAjmModuleUnregister", .function = trace.wrap("sceAjmModuleUnregister", &ajmModuleUnregister), .expect_id = "Wi7DtlLV+KI" },
+    .{ .name = "sceAjmInstanceCreate", .function = trace.wrap("sceAjmInstanceCreate", &ajmInstanceCreate), .expect_id = "AxoDrINp4J8" },
+    .{ .name = "sceAjmInstanceDestroy", .function = trace.wrap("sceAjmInstanceDestroy", &ajmInstanceDestroy), .expect_id = "RbLbuKv8zho" },
+    .{ .name = "sceAjmMemoryRegister", .function = trace.wrap("sceAjmMemoryRegister", &ajmMemoryRegister), .expect_id = "bkRHEYG6lEM" },
+    .{ .name = "sceAjmMemoryUnregister", .function = trace.wrap("sceAjmMemoryUnregister", &ajmMemoryUnregister), .expect_id = "pIpGiaYkHkM" },
+    .{ .name = "sceAjmBatchInitialize", .function = trace.wrap("sceAjmBatchInitialize", &ajmBatchInitialize), .expect_id = "MmpF1XsQiHw" },
+    .{ .name = "sceAjmBatchStart", .function = trace.wrap("sceAjmBatchStart", &ajmBatchStart), .expect_id = "5tOfnaClcqM" },
+    .{ .name = "sceAjmBatchWait", .function = trace.wrap("sceAjmBatchWait", &ajmBatchWait), .expect_id = "-qLsfDAywIY" },
+    .{ .name = "sceAjmBatchCancel", .function = trace.wrap("sceAjmBatchCancel", &ajmBatchCancel), .expect_id = "NVDXiUesSbA" },
+    .{ .name = "sceAjmBatchErrorDump", .function = trace.wrap("sceAjmBatchErrorDump", &ajmBatchErrorDump), .expect_id = "WfAiBW8Wcek" },
+    .{ .name = "sceAjmBatchJobInitialize", .function = trace.wrap("sceAjmBatchJobInitialize", &ajmBatchJobInitialize), .expect_id = "ezM2OhNxzck" },
+    .{ .name = "sceAjmBatchJobGetCodecInfo", .function = trace.wrap("sceAjmBatchJobGetCodecInfo", &ajmBatchJobGetCodecInfo), .expect_id = "uSrXaxT+oPQ" },
+    .{ .name = "sceAjmBatchJobSetGaplessDecode", .function = trace.wrap("sceAjmBatchJobSetGaplessDecode", &ajmBatchJobSetGaplessDecode), .expect_id = "SkEwpiu3tZg" },
+    .{ .name = "sceAjmBatchJobDecode", .function = trace.wrap("sceAjmBatchJobDecode", &ajmBatchJobDecode), .expect_id = "39WxhR-ePew" },
+    .{ .name = "sceAjmBatchJobDecodeSplit", .function = trace.wrap("sceAjmBatchJobDecodeSplit", &ajmBatchJobDecodeSplit), .expect_id = "SJ3i0DXP8vg" },
+    .{ .name = "sceAjmBatchJobClearContext", .function = trace.wrap("sceAjmBatchJobClearContext", &ajmBatchJobClearContext), .expect_id = "uJ3m8INuikg" },
+    .{ .name = "sceAjmBatchJobSetResampleParameters", .function = trace.wrap("sceAjmBatchJobSetResampleParameters", &ajmBatchJobSetResampleParameters), .expect_id = "81HsnXFbWS4" },
+    .{ .name = "sceAjmBatchJobSetResampleParametersEx", .function = trace.wrap("sceAjmBatchJobSetResampleParametersEx", &ajmBatchJobSetResampleParametersEx), .expect_id = "5ldnD16rYZw" },
+    .{ .name = "sceAjmBatchJobGetResampleInfo", .function = trace.wrap("sceAjmBatchJobGetResampleInfo", &ajmBatchJobGetResampleInfo), .expect_id = "JkdNCocpu1M" },
+    .{ .name = "sceAjmBatchJobGetStatistics", .function = trace.wrap("sceAjmBatchJobGetStatistics", &ajmBatchJobGetStatistics), .expect_id = "3cAg7xN995U" },
+    .{ .name = "sceAjmBatchJobControl", .function = trace.wrap("sceAjmBatchJobControl", &ajmBatchJobControl), .expect_id = "7FZsbyVRM4U" },
+    .{ .name = "sceAjmBatchJobRunSplit", .function = trace.wrap("sceAjmBatchJobRunSplit", &ajmBatchJobRunSplit), .expect_id = "Z9NVCesiP0Q" },
+    .{ .name = "sceAjmDecMp3ParseFrame", .function = trace.wrap("sceAjmDecMp3ParseFrame", &ajmDecMp3ParseFrame), .expect_id = "eDFeTyi+G3Y" },
+    .{ .name = "sceAjmDecAt9ParseConfigData", .function = trace.wrap("sceAjmDecAt9ParseConfigData", &ajmDecAt9ParseConfigData), .expect_id = "1t3ixYNXyuc" },
+};
+
+pub fn reset() void {
+    @import("audio3d.zig").reset();
+    // Runtime teardown can happen without the title closing its port. Release
+    // WinMM before forgetting port ownership so a later runtime in this process
+    // can claim the device cleanly.
+    device.close();
+    device_owner.store(-1, .release);
+    device_owner_last_signal_ms.store(0, .release);
+
+    port_mutex.lock();
+    for (0..maximum_legacy_ports) |index| releaseLegacyOutput(@intCast(index + 1));
+    legacy_ports = [_]LegacyPort{.{}} ** maximum_legacy_ports;
+    port_mutex.unlock();
+
+    audio_object_mutex.lock();
+    audio_objects = [_]AudioObject{.{}} ** maximum_audio_objects;
+    audio_object_mutex.unlock();
+
+    audiodec_mutex.lock();
+    for (&audiodec_instances) |*instance| if (instance.active) instance.decoder.deinit();
+    audiodec_init_count = @splat(0);
+    audiodec_instances = [_]LegacyAudiodec{.{}} ** maximum_audiodec_instances;
+    audiodec_mutex.unlock();
+
+    acm_mutex.lock();
+    for (&acm_contexts) |*entry| {
+        entry.runtime.deinit();
+        entry.* = .{};
+    }
+    acm_mutex.unlock();
+    next_acm_batch.store(1, .monotonic);
+
+    ajm_mutex.lock();
+    for (&ajm_instances) |*instance| if (instance.active) instance.decoder.deinit();
+    ajm_contexts = [_]bool{false} ** maximum_ajm_contexts;
+    ajm_modules = [_][maximum_ajm_codecs]bool{[_]bool{false} ** maximum_ajm_codecs} ** maximum_ajm_contexts;
+    ajm_instances = [_]AjmInstance{.{}} ** maximum_ajm_instances;
+    ajm_mutex.unlock();
+    next_batch.store(1, .monotonic);
+    ngs2_mutex.lock();
+    for (ngs2_voices.items) |*voice| ngs2ResetVoice(voice);
+    for (&ngs2_waveform_cache, 0..) |*cached, index| {
+        cached.references = 0;
+        ngs2EvictCachedWaveform(index);
+    }
+    ngs2_waveform_cache = [_]Ngs2CachedWaveform{.{}} ** maximum_ngs2_cached_waveforms;
+    ngs2_waveform_cache_bytes = 0;
+    ngs2_waveform_cache_sequence = 0;
+    ngs2_systems = [_]Ngs2System{.{}} ** maximum_ngs2_systems;
+    ngs2_racks = [_]Ngs2Rack{.{}} ** maximum_ngs2_racks;
+    ngs2_voices.deinit(std.heap.page_allocator);
+    ngs2_voices = .empty;
+    ngs2_mutex.unlock();
+    next_ngs2_handle.store(0x4e47_0001, .monotonic);
+    ngs2_render_calls.store(0, .monotonic);
+    ngs2_control_logs.store(0, .monotonic);
+    ngs2_state_logs.store(0, .monotonic);
+    ngs2_waveform_logs.store(0, .monotonic);
+    ngs2_command_logs.store(0, .monotonic);
+    ngs2_sampler_detail_logs = .{ 0, 0 };
+    ajm_decode_jobs.store(0, .monotonic);
+    audio_out_play_ok.store(0, .monotonic);
+    audio_out_play_fail.store(0, .monotonic);
+    audio_test_tone_phase = 0;
+    audio_test_tone_enabled = null;
+    audio_disabled = null;
+    host_target_latency_ms.store(audio_device.default_target_latency_ms, .release);
+}
+
+pub fn register(db: *symbols.Database, gpa: std.mem.Allocator) symbols.Error!void {
+    try @import("audio3d.zig").register(db, gpa);
+    const modules_to_register = [_]struct { lib: []const u8, mod: []const u8, exports: []const symbols.Export }{
+        .{ .lib = "libSceAudioOut", .mod = "libSceAudioOut", .exports = &audio_out_exports },
+        .{ .lib = "libSceAudioIn", .mod = "libSceAudioIn", .exports = &audio_in_exports },
+        .{ .lib = "libSceAudioOut2", .mod = "libSceAudioOut", .exports = &audio_out2_exports },
+        .{ .lib = "libSceAudioOut2", .mod = "libSceAudioOut2", .exports = &audio_out2_exports },
+        .{ .lib = "libSceAudioOut", .mod = "libSceAudioOut2", .exports = &audio_out2_exports },
+        .{ .lib = "libSceAudiodec", .mod = "libSceAudiodec", .exports = &audiodec_exports },
+        .{ .lib = "libSceAcm", .mod = "libSceAcm", .exports = &acm_exports },
+        .{ .lib = "libSceNgs2", .mod = "libSceNgs2", .exports = &ngs2_exports },
+        .{ .lib = "libSceTextToSpeech2", .mod = "libSceTextToSpeech2", .exports = &tts2_exports },
+        .{ .lib = "libSceAjm", .mod = "libSceAjm", .exports = &ajm_exports },
+    };
+
+    inline for (modules_to_register) |m| {
+        try db.addLibrary(gpa, .{ .name = m.lib, .version = 1 }, .{ .name = m.mod, .version_major = 1, .version_minor = 1 }, m.exports);
+        try db.addLibrary(gpa, .{ .name = m.lib, .version = 1 }, .{ .name = m.mod, .version_major = 1, .version_minor = 0 }, m.exports);
+    }
+}
+
+test "legacy AudioOut formats distinguish standard 8-channel integer and float PCM" {
+    try std.testing.expectEqual(@as(?u8, 8), formatChannels(6));
+    try std.testing.expectEqual(audio_device.SampleFormat.signed16, formatSamples(6).?);
+    try std.testing.expectEqual(@as(?u8, 8), formatChannels(7));
+    try std.testing.expectEqual(audio_device.SampleFormat.float32, formatSamples(7).?);
+}
+
+test "ACM waits reject nonexistent jobs and respect context lifetime" {
+    reset();
+    defer reset();
+    var context: u32 = 0;
+    try std.testing.expectEqual(errno.ok, acmContextCreate(&context));
+    try std.testing.expect(acmBatchWait(context, 0xffffffff, 0xffffffff) != errno.ok);
+    try std.testing.expect(acmBatchWait(context, 0, 0) != errno.ok);
+    var batch: u32 = 0;
+    try std.testing.expectEqual(errno.ok, acmBatchStartBuffer(context, 0, 0, null, &batch));
+    try std.testing.expectEqual(errno.ok, acmBatchWait(context, batch, 0));
+    try std.testing.expect(acmBatchWait(context, batch + 1, 0) != errno.ok);
+    try std.testing.expectEqual(errno.ok, acmContextDestroy(context));
+    try std.testing.expect(acmBatchWait(context, batch, 0) != errno.ok);
+    try std.testing.expectEqual(errno.ok, acmContextCreate(&context));
+    try std.testing.expect(acmBatchWait(context, batch, 0) != errno.ok);
+}
+
+test "headless AudioOut preserves port lifecycle" {
+    reset();
+    const handle = audioOutOpen(1, 0, 0, 256, 48_000, 1);
+    try std.testing.expect(handle > 0);
+    var samples: [512]i16 = [_]i16{1} ** 512;
+    try std.testing.expectEqual(errno.ok, audioOutOutput(handle, &samples));
+    var state = AudioOutPortState{};
+    try std.testing.expectEqual(errno.ok, audioOutGetPortState(handle, &state));
+    try std.testing.expectEqual(@as(u8, 2), state.channel);
+    try std.testing.expectEqual(errno.ok, audioOutClose(handle));
+    try std.testing.expectEqual(audio_out_error_invalid_port, audioOutClose(handle));
+}
+
+test "AudioOut2 queue drains whole grains while retaining fractional playback time" {
+    var context = AudioObject{ .kind = .context, .grains = 480, .frequency = 48_000, .queue_depth = 4, .queued_grains = 4, .queue_updated_ns = 100 * std.time.ns_per_ms };
+    updateAudioOut2Queue(&context, 109 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 4), context.queued_grains);
+    updateAudioOut2Queue(&context, 125 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 2), context.queued_grains);
+    try std.testing.expectEqual(@as(u64, 120 * std.time.ns_per_ms), context.queue_updated_ns);
+    updateAudioOut2Queue(&context, 130 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), context.queued_grains);
+    updateAudioOut2Queue(&context, 500 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 0), context.queued_grains);
+    context.queued_grains = 1;
+    updateAudioOut2Queue(&context, 509 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), context.queued_grains);
+}
+
+test "AudioOut2 depth-one polling retains the sample clock instead of rounding every grain" {
+    const start = 100 * std.time.ns_per_ms;
+    var context = AudioObject{ .kind = .context, .grains = 256, .frequency = 48_000, .queue_depth = 1, .queued_grains = 1, .queue_updated_ns = start };
+    var completed: u32 = 0;
+    // A guest polling at 1 ms still needs 48,000 samples/second. The old
+    // empty-queue rebase completed only 166 grains here instead of 187.
+    for (1..1001) |millisecond| {
+        updateAudioOut2Queue(&context, start + millisecond * std.time.ns_per_ms);
+        if (context.queued_grains == 0) {
+            completed += 1;
+            // Extra queue-level queries before Push must retain the phase.
+            const phase = context.queue_updated_ns;
+            updateAudioOut2Queue(&context, start + millisecond * std.time.ns_per_ms);
+            try std.testing.expectEqual(phase, context.queue_updated_ns);
+            context.queued_grains = 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 187), completed);
+    updateAudioOut2Queue(&context, start + 10 * std.time.ns_per_s);
+    try std.testing.expectEqual(@as(u32, 0), context.queued_grains);
+    try std.testing.expectEqual(start + 10 * std.time.ns_per_s, context.queue_updated_ns);
+    context.queued_grains = 1;
+    updateAudioOut2Queue(&context, start + 10 * std.time.ns_per_s + 5 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 1), context.queued_grains);
+}
+
+test "AudioOut2 speaker layout advertises front speakers and initializes every angle" {
+    var guarded: [audio_out2_speaker_info_bytes + 16]u8 = @splat(0xab);
+    try std.testing.expectEqual(errno.ok, audioOut2GetSpeakerInfo(guarded[0..audio_out2_speaker_info_bytes], 1));
+    try std.testing.expectEqual(@as(u8, 0), guarded[0]);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, guarded[4..8], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, guarded[8..12], .little));
+    try std.testing.expectEqual(@as(i16, -30), std.mem.readInt(i16, guarded[16..18], .little));
+    try std.testing.expectEqual(@as(i16, 30), std.mem.readInt(i16, guarded[20..22], .little));
+    for (guarded[24..audio_out2_speaker_info_bytes]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (guarded[audio_out2_speaker_info_bytes..]) |byte| try std.testing.expectEqual(@as(u8, 0xab), byte);
+    try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2GetSpeakerInfo(null, 1));
+}
+
+test "AudioOut2 context defaults and handles are deterministic" {
+    reset();
+    var parameters = AudioOut2ContextParam{};
+    try std.testing.expectEqual(errno.ok, audioOut2ContextResetParam(&parameters));
+    try std.testing.expectEqual(@as(u32, 4), parameters.queue_depth);
+    var size: usize = 0;
+    try std.testing.expectEqual(errno.ok, audioOut2ContextQueryMemory(&parameters, &size));
+    try std.testing.expect(size > 0x10000);
+    var context: u64 = 0;
+    try std.testing.expectEqual(errno.ok, audioOut2ContextCreate(&parameters, null, size, &context));
+    var available: u32 = 0;
+    try std.testing.expectEqual(errno.ok, audioOut2ContextGetQueueLevel(context, null, &available));
+    try std.testing.expectEqual(@as(u32, 4), available);
+    var port: u64 = 0;
+    const port_parameters = AudioOut2PortParam{
+        .port_type = 0,
+        .padding = 0,
+        .data_format = 8 << 8,
+        .sampling_frequency = 48_000,
+        .flags = 0,
+        .user_handle = 0,
+        .reserved = [_]u32{0} ** 10,
+    };
+    try std.testing.expectEqual(errno.ok, audioOut2PortCreate(context, &port_parameters, &port));
+    var state: [audio_out2_port_state_bytes]u8 = @splat(0xab);
+    try std.testing.expectEqual(errno.ok, audioOut2PortGetState(port, &state));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, state[0x00..0x02], .little));
+    try std.testing.expectEqual(@as(u8, 8), state[0x02]);
+    try std.testing.expectEqual(@as(i16, 127), std.mem.readInt(i16, state[0x04..0x06], .little));
+    try std.testing.expectEqual(@as(u8, 0), state[0x10]);
+    try std.testing.expectEqualSlices(u8, &(@as([0x30]u8, @splat(0))), state[0x10..]);
+    try std.testing.expectEqual(audio_out2_error_invalid_parameter, audioOut2PortGetState(port, null));
+    try std.testing.expectEqual(errno.ok, audioOut2PortGetState(std.math.maxInt(u64), &state));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, state[0x00..0x02], .little));
+    try std.testing.expectEqual(@as(u8, 2), state[0x02]);
+    try std.testing.expectEqual(@as(i16, 127), std.mem.readInt(i16, state[0x04..0x06], .little));
+}
+
+test "NGS2 derives one bounded float32 render grain from all buses" {
+    const buffers = [_]Ngs2RenderBuffer{
+        .{ .address = 1, .size = 8192, .waveform_type = 0x18, .channels = 8 },
+        .{ .address = 2, .size = 1024, .waveform_type = 0x18, .channels = 1 },
+        .{ .address = 3, .size = 0, .waveform_type = 0x18, .channels = 2 },
+    };
+    try std.testing.expectEqual(@as(u32, 256), ngs2RenderFrameCount(&buffers));
+    try std.testing.expectEqual(@as(u32, 4096), ngs2RenderFrameCount(&.{
+        .{ .address = 1, .size = 1024 * 1024, .waveform_type = 0x18, .channels = 1 },
+    }));
+    try std.testing.expectEqual(@as(u32, 0), ngs2RenderFrameCount(&.{
+        .{ .address = 1, .size = 1024, .waveform_type = 0x18, .channels = 0 },
+    }));
+}
+
+test "NGS2 rack info preserves full SDK options and bounds both output ABIs" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    var options: [176]u8 = @splat(0);
+    std.mem.writeInt(u64, options[0..8], options.len, .little);
+    @memcpy(options[8..15], "sampler");
+    std.mem.writeInt(u32, options[76..80], 512, .little);
+    std.mem.writeInt(u32, options[80..84], 3, .little);
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, @intFromPtr(&options), 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 2, &voice));
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2RackGetVoiceHandle(rack, 3, &voice));
+    for ([_]usize{ 216, 232 }) |size| {
+        var output: [240]u8 align(8) = @splat(0xa5);
+        try std.testing.expectEqual(errno.ok, ngs2RackGetInfo(rack, @intFromPtr(&output), size));
+        const info: *const Ngs2RackInfo = @ptrCast(&output);
+        try std.testing.expectEqualStrings("sampler", std.mem.sliceTo(&info.name, 0));
+        try std.testing.expectEqual(system, info.system);
+        try std.testing.expectEqual(rack, info.handle);
+        try std.testing.expectEqual(@as(u32, 3), info.max_voices);
+        try std.testing.expectEqual(@as(u32, 512), info.max_grain);
+        try std.testing.expectEqual(@as(u8, 0xa5), output[size]);
+        if (size == 232) try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(0))), output[216..232]);
+    }
+}
+
+test "NGS2 port query tracks controls and compact commands independently" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var master_rack: u64 = 0;
+    var voice: u64 = 0;
+    var master: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x3000, 0, 0, &master_rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(master_rack, 0, &master));
+    var output = extern struct { info: Ngs2VoicePortInfo = .{}, canary: u64 = 0xdeadbeef }{};
+    const ptr = @intFromPtr(&output.info);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.info);
+
+    // One linked list sets all query fields on port 1, leaving port 0 alone.
+    var controls: [72]u8 align(8) = @splat(0);
+    for ([_]u32{ 2, 3, 4, 5 }, 0..) |id, index| {
+        const bytes = controls[index * 16 ..];
+        std.mem.writeInt(u16, bytes[0..2], if (id == 5) 24 else 16, .little);
+        std.mem.writeInt(i16, bytes[2..4], if (id == 5) 0 else 16, .little);
+        std.mem.writeInt(u32, bytes[4..8], id, .little);
+        std.mem.writeInt(u32, bytes[8..12], 1, .little);
+    }
+    std.mem.writeInt(u32, controls[12..16], @bitCast(@as(f32, 0.25)), .little);
+    std.mem.writeInt(u32, controls[44..48], 128, .little);
+    std.mem.writeInt(u32, controls[60..64], 2, .little);
+    std.mem.writeInt(u64, controls[64..72], master, .little);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&controls)));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{ .matrix_id = 0, .volume = 0.25, .num_delay_samples = 128, .dest_input_id = 2, .dest_handle = master }, output.info);
+    try std.testing.expectEqual(@as(u64, 0xdeadbeef), output.canary);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 0, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.info);
+
+    var commands: [32]u8 = @splat(0);
+    std.mem.writeInt(u32, commands[0..4], 0x01000006, .little);
+    commands[5] = 1;
+    std.mem.writeInt(u32, commands[8..12], @bitCast(@as(f32, 0.5)), .little);
+    std.mem.writeInt(u32, commands[16..20], 0x01000007, .little);
+    commands[21] = 3;
+    std.mem.writeInt(i32, commands[24..28], -1, .little);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&commands), 2, 0));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(f32, 0.5), output.info.volume);
+    try std.testing.expectEqual(@as(i32, -1), output.info.matrix_id);
+    try std.testing.expectEqual(@as(f32, 1), ngs2FindVoice(voice).?.gain);
+
+    // Destroying a destination disconnects it without clearing other settings.
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(master_rack, 0));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(u64, 0), output.info.dest_handle);
+    try std.testing.expectEqual(@as(u32, 0), output.info.dest_input_id);
+    try std.testing.expectEqual(@as(u32, 128), output.info.num_delay_samples);
+    try std.testing.expectEqual(@as(f32, 0.5), output.info.volume);
+
+    // Invalid controls must leave the last accepted values intact.
+    std.mem.writeInt(u32, commands[0..4], 0x08000006, .little);
+    try std.testing.expectEqual(ngs2_error_invalid_port, ngs2VoiceRunCommands(voice, @intFromPtr(&commands), 1, 0));
+    std.mem.writeInt(u32, commands[0..4], 0x01000006, .little);
+    std.mem.writeInt(u32, commands[8..12], @bitCast(std.math.nan(f32)), .little);
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2VoiceRunCommands(voice, @intFromPtr(&commands), 1, 0));
+    std.mem.writeInt(i32, commands[24..28], 1, .little);
+    try std.testing.expectEqual(ngs2_error_invalid_matrix, ngs2VoiceRunCommands(voice, @intFromPtr(&commands) + 16, 1, 0));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(f32, 0.5), output.info.volume);
+    try std.testing.expectEqual(@as(i32, -1), output.info.matrix_id);
+
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(rack, 0));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.info);
+}
+
+test "NGS2 port query rejects invalid ranges and handles without touching output" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    var options: [176]u8 = @splat(0);
+    std.mem.writeInt(u64, options[0..8], options.len, .little);
+    std.mem.writeInt(u32, options[92..96], 2, .little);
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, @intFromPtr(&options), 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    var output: [25]u8 = @splat(0xa5);
+    const ptr = @intFromPtr(&output);
+    try std.testing.expectEqual(ngs2_error_invalid_output, ngs2VoiceGetPortInfo(voice, 0, 0, 24));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x804a8011))), ngs2VoiceGetPortInfo(voice, 0, ptr, 23));
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x804a8011))), ngs2VoiceGetPortInfo(voice, 0, ptr, 25));
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceGetPortInfo(voice, 0, 1, 24));
+    try std.testing.expectEqual(ngs2_error_invalid_voice, ngs2VoiceGetPortInfo(0, 0, ptr, 24));
+    try std.testing.expectEqual(ngs2_error_invalid_port, ngs2VoiceGetPortInfo(voice, 2, ptr, 24));
+    try std.testing.expectEqualSlices(u8, &(@as([25]u8, @splat(0xa5))), &output);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 1, ptr, 24));
+    try std.testing.expectEqual(@as(u8, 0xa5), output[24]);
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(rack, 0));
+    try std.testing.expectEqual(ngs2_error_invalid_voice, ngs2VoiceGetPortInfo(voice, 0, ptr, 24));
+}
+
+test "NGS2 port query checks guest output protection and page boundaries" {
+    const memory = @import("memory");
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    var space = try memory.AddressSpace.initWithDirectMemory(std.testing.allocator, memory.page_size * 2);
+    defer space.deinit();
+    kernel_memory.init(std.testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&space);
+    const address = memory.user.start;
+    try space.mapFixed(address, memory.page_size, .read_write, .direct_memory, 0);
+    try space.mapFixed(address + memory.page_size, memory.page_size, .read_only, .direct_memory, memory.page_size);
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceGetPortInfo(voice, 0, address + memory.page_size, 24));
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceGetPortInfo(voice, 0, address + memory.page_size - 16, 24));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetPortInfo(voice, 0, address + memory.page_size - 24, 24));
+    const output: *const Ngs2VoicePortInfo = @ptrFromInt(address + memory.page_size - 24);
+    try std.testing.expectEqualDeep(Ngs2VoicePortInfo{}, output.*);
+}
+
+test "NGS2 channel query resolves Animal Well import and follows sampler setup" {
+    reset();
+    defer reset();
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    const entry = db.find(.{
+        .id = "9eic4AmjGVI".*,
+        .library = .{ .name = "libSceNgs2" },
+        .module = .{ .name = "libSceNgs2" },
+        .type = .function,
+    }) orelse return error.MissingVoiceQueryInfo;
+    try std.testing.expectEqualStrings("sceNgs2VoiceQueryInfo", entry.name);
+    const query: *const fn (u64, u32, u64, usize) callconv(abi.guest) i32 = @ptrFromInt(entry.address);
+    var system: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    for ([_]u32{ 0x1000, 0x4001 }) |rack_id| {
+        var rack: u64 = 0;
+        var voice: u64 = 0;
+        var other: u64 = 0;
+        try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, rack_id, 0, 0, &rack));
+        try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+        try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 1, &other));
+        // Use deliberately unaligned output with a canary on each side.
+        var bytes: [10]u8 = @splat(0xa5);
+        const output = @intFromPtr(&bytes) + 1;
+        try std.testing.expectEqual(errno.ok, query(voice, 0x4001, output, 8));
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[1..5], .little));
+        const Setup = extern struct { header: Ngs2VoiceParamHeader, format: Ngs2WaveformFormat };
+        var setup = Setup{ .header = .{ .size = @sizeOf(Setup), .next = 0, .id = rack_id << 16 }, .format = .{ .waveform_type = 0x18, .channels = 1, .sample_rate = 48000 } };
+        for ([_]u32{ 1, 2, 6, 8, 1 }) |channels| {
+            setup.format.channels = channels;
+            try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&setup)));
+            try std.testing.expectEqual(errno.ok, query(voice, 0x4001, output, 8));
+            try std.testing.expectEqual(channels, std.mem.readInt(u32, bytes[1..5], .little));
+            try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[5..9], .little));
+            try std.testing.expectEqual(@as(u8, 0xa5), bytes[0]);
+            try std.testing.expectEqual(@as(u8, 0xa5), bytes[9]);
+        }
+        setup.format.channels = 9;
+        try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2VoiceControl(voice, @intFromPtr(&setup)));
+        try std.testing.expectEqual(errno.ok, query(voice, 0x4001, output, 8));
+        try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[1..5], .little));
+        try std.testing.expectEqual(errno.ok, query(other, 0x4001, output, 8));
+        try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, bytes[1..5], .little));
+        try std.testing.expectEqual(errno.ok, ngs2RackDestroy(rack, 0));
+        try std.testing.expectEqual(ngs2_error_invalid_voice, query(voice, 0x4001, output, 8));
+    }
+}
+
+test "NGS2 channel query tracks mixer output widths" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    for ([_]u32{ 0x2000, 0x3000, 0x2001, 0x4002 }) |rack_id| {
+        var rack: u64 = 0;
+        var voice: u64 = 0;
+        try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, rack_id, 0, 0, &rack));
+        try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+        const separate_io = rack_id == 0x2001 or rack_id == 0x4002;
+        var setup: [24]u8 align(8) = @splat(0);
+        std.mem.writeInt(u16, setup[0..2], if (separate_io) 24 else 16, .little);
+        std.mem.writeInt(u32, setup[4..8], rack_id << 16, .little);
+        var info = Ngs2VoiceChannelsInfo{ .num_channels = 99, .reserved = 99 };
+        for ([_]u32{ 2, 6, 8 }) |channels| {
+            std.mem.writeInt(u32, setup[8..12], channels, .little);
+            if (separate_io) std.mem.writeInt(u32, setup[12..16], channels, .little);
+            try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&setup)));
+            try std.testing.expectEqual(errno.ok, ngs2VoiceQueryInfo(voice, 0x4001, @intFromPtr(&info), 8));
+            try std.testing.expectEqualDeep(Ngs2VoiceChannelsInfo{ .num_channels = channels }, info);
+        }
+        std.mem.writeInt(u32, setup[8..12], 0, .little);
+        try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2VoiceControl(voice, @intFromPtr(&setup)));
+        try std.testing.expectEqual(errno.ok, ngs2VoiceQueryInfo(voice, 0x4001, @intFromPtr(&info), 8));
+        try std.testing.expectEqual(@as(u32, 8), info.num_channels);
+        std.mem.writeInt(u16, setup[0..2], 8, .little);
+        try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2VoiceControl(voice, @intFromPtr(&setup)));
+    }
+}
+
+test "NGS2 channel query rejects invalid records sizes handles and output memory" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    var output: [9]u8 = @splat(0xa5);
+    const ptr = @intFromPtr(&output);
+    try std.testing.expectEqual(ngs2_error_invalid_query_output, ngs2VoiceQueryInfo(voice, 0x4001, 0, 8));
+    for ([_]usize{ 0, 7, 9, std.math.maxInt(usize) }) |size| {
+        try std.testing.expectEqual(ngs2_error_invalid_query_size, ngs2VoiceQueryInfo(voice, 0x4001, ptr, size));
+    }
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2VoiceQueryInfo(voice, 0x4000, ptr, 8));
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceQueryInfo(voice, 0x4001, 1, 8));
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceQueryInfo(voice, 0x4001, std.math.maxInt(u64) - 3, 8));
+    for ([_]u64{ 0, system, rack }) |bad_handle| {
+        try std.testing.expectEqual(ngs2_error_invalid_voice, ngs2VoiceQueryInfo(bad_handle, 0x4001, ptr, 8));
+    }
+    try std.testing.expectEqual(errno.ok, ngs2SystemDestroy(system, 0));
+    try std.testing.expectEqual(ngs2_error_invalid_voice, ngs2VoiceQueryInfo(voice, 0x4001, ptr, 8));
+    try std.testing.expectEqualSlices(u8, &(@as([9]u8, @splat(0xa5))), &output);
+}
+
+test "NGS2 channel query honors guest write protection and exact page bounds" {
+    const memory = @import("memory");
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    var space = try memory.AddressSpace.initWithDirectMemory(std.testing.allocator, memory.page_size * 2);
+    defer space.deinit();
+    kernel_memory.init(std.testing.allocator);
+    defer kernel_memory.deinit();
+    kernel_memory.attachAddressSpace(&space);
+    const address = memory.user.start;
+    try space.mapFixed(address, memory.page_size, .read_write, .direct_memory, 0);
+    try space.mapFixed(address + memory.page_size, memory.page_size, .read_only, .direct_memory, memory.page_size);
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceQueryInfo(voice, 0x4001, address + memory.page_size, 8));
+    try std.testing.expectEqual(errno.KernelError.efault.raw(), ngs2VoiceQueryInfo(voice, 0x4001, address + memory.page_size - 4, 8));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceQueryInfo(voice, 0x4001, address + memory.page_size - 8, 8));
+    const output: *const Ngs2VoiceChannelsInfo = @ptrFromInt(address + memory.page_size - 8);
+    try std.testing.expectEqualDeep(Ngs2VoiceChannelsInfo{ .num_channels = 0 }, output.*);
+}
+
+test "NGS2 waveform file parses a mounted file at an offset and closes descriptors" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var wave: [51]u8 = @splat(0);
+    @memcpy(wave[3..7], "RIFF");
+    std.mem.writeInt(u32, wave[7..11], 40, .little);
+    @memcpy(wave[11..19], "WAVEfmt ");
+    std.mem.writeInt(u32, wave[19..23], 16, .little);
+    std.mem.writeInt(u16, wave[23..25], 1, .little);
+    std.mem.writeInt(u16, wave[25..27], 2, .little);
+    std.mem.writeInt(u32, wave[27..31], 48000, .little);
+    std.mem.writeInt(u16, wave[35..37], 4, .little);
+    std.mem.writeInt(u16, wave[37..39], 16, .little);
+    @memcpy(wave[39..43], "data");
+    std.mem.writeInt(u32, wave[43..47], 4, .little);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tone.wav", .data = &wave });
+    filesystem.attach(std.testing.io, tmp.dir);
+    defer filesystem.detach();
+    const before = filesystem.openCount();
+    var info = Ngs2WaveformInfo{};
+    try std.testing.expectEqual(errno.ok, ngs2ParseWaveformFile("/app0/tone.wav", 3, &info));
+    try std.testing.expectEqual(@as(u32, 47), info.data_offset);
+    try std.testing.expectEqual(@as(usize, 47), info.blocks[0].data_offset);
+    try std.testing.expectEqual(@as(u32, 1), info.samples);
+    try std.testing.expect(ngs2ParseWaveformFile("/app0/tone.wav", 0, &info) != errno.ok);
+    try std.testing.expectEqual(before, filesystem.openCount());
+}
+
+test "NGS2 in-memory ATRAC9 metadata retains codec geometry and preroll" {
+    var wave: [100 + 384]u8 = @splat(0);
+    @memcpy(wave[0..4], "RIFF");
+    std.mem.writeInt(u32, wave[4..8], wave.len - 8, .little);
+    @memcpy(wave[8..16], "WAVEfmt ");
+    std.mem.writeInt(u32, wave[16..20], 52, .little);
+    std.mem.writeInt(u16, wave[20..22], 0xfffe, .little);
+    std.mem.writeInt(u16, wave[22..24], 2, .little);
+    std.mem.writeInt(u32, wave[24..28], 48000, .little);
+    std.mem.writeInt(u16, wave[32..34], 384, .little);
+    std.mem.writeInt(u16, wave[36..38], 34, .little);
+    std.mem.writeInt(u16, wave[38..40], 1024, .little);
+    @memcpy(wave[44..60], &[_]u8{ 0xd2, 0x42, 0xe1, 0x47, 0xba, 0x36, 0x8d, 0x4d, 0x88, 0xfc, 0x61, 0x65, 0x4f, 0x8c, 0x83, 0x6c });
+    std.mem.writeInt(u32, wave[64..68], 0xfe740bf0, .big);
+    @memcpy(wave[72..76], "fact");
+    std.mem.writeInt(u32, wave[76..80], 12, .little);
+    std.mem.writeInt(u32, wave[80..84], 700, .little);
+    std.mem.writeInt(u32, wave[84..88], 256, .little);
+    std.mem.writeInt(u32, wave[88..92], 256, .little);
+    @memcpy(wave[92..96], "data");
+    std.mem.writeInt(u32, wave[96..100], 384, .little);
+    var info: Ngs2WaveformInfo = .{};
+    try std.testing.expectEqual(errno.ok, ngs2ParseWaveformData(@intFromPtr(&wave), wave.len, &info));
+    try std.testing.expectEqual(@as(u32, 0x40), info.format.waveform_type);
+    try std.testing.expectEqual(@as(u32, 0xfe740bf0), info.format.config_data);
+    try std.testing.expectEqual(@as(u32, 384), info.audio_frame_size);
+    try std.testing.expectEqual(@as(u32, 256), info.blocks[0].skip_samples);
+    try std.testing.expectEqual(@as(u32, 700), info.blocks[0].samples);
+    try std.testing.expectEqual(@as(usize, 100), info.blocks[0].data_offset);
+    try std.testing.expectEqual(@as(i32, @bitCast(@as(u32, 0x804a8430))), ngs2ParseWaveformData(@intFromPtr(&wave), wave.len - 1, &info));
+}
+
+test "NGS2 custom sampler rack voices take the sampler format and block parameters" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x4001, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    const Setup = extern struct { header: Ngs2VoiceParamHeader, format: Ngs2WaveformFormat };
+    const setup = Setup{ .header = .{ .size = @sizeOf(Setup), .next = 0, .id = 0x40010000 }, .format = .{ .waveform_type = 0x12, .channels = 2, .sample_rate = 48000 } };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&setup)));
+    var samples: [256 * 2]i16 = undefined;
+    for (0..256) |frame| {
+        samples[frame * 2] = 8192;
+        samples[frame * 2 + 1] = -16384;
+    }
+    const block = Ngs2WaveformBlock{ .data_size = @sizeOf(@TypeOf(samples)), .samples = 256 };
+    const Queue = extern struct { header: Ngs2VoiceParamHeader, address: u64, flags: u32, count: u32, blocks: u64 };
+    var queue = Queue{ .header = .{ .size = @sizeOf(Queue), .next = 0, .id = 0x40010001 }, .address = @intFromPtr(&samples), .flags = 0, .count = 1, .blocks = @intFromPtr(&block) };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&queue)));
+    var command = [_]u64{ 0x0000040000000002, 1 };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    var output: [256 * 2]f32 = @splat(9);
+    const buffers = [_]Ngs2RenderBuffer{
+        .{ .address = @intFromPtr(&output), .size = @sizeOf(@TypeOf(output)), .waveform_type = 0x18, .channels = 2 },
+    };
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 1));
+    for (0..256) |frame| {
+        try std.testing.expectEqual(@as(f32, 0.25), output[frame * 2]);
+        try std.testing.expectEqual(@as(f32, -0.5), output[frame * 2 + 1]);
+    }
+}
+
+test "NGS2 raw PCM commands honor grain size multi-bus cursors pause and state readback" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    const Setup = extern struct { header: Ngs2VoiceParamHeader, format: Ngs2WaveformFormat };
+    const setup = Setup{ .header = .{ .size = @sizeOf(Setup), .next = 0, .id = 0x10000000 }, .format = .{ .waveform_type = 0x12, .channels = 2, .sample_rate = 48000 } };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&setup)));
+    var samples: [512 * 2]i16 = undefined;
+    for (0..512) |frame| {
+        samples[frame * 2] = 8192;
+        samples[frame * 2 + 1] = -16384;
+    }
+    const block = Ngs2WaveformBlock{ .data_size = @sizeOf(@TypeOf(samples)), .samples = 512, .user_data = 77 };
+    const Queue = extern struct { header: Ngs2VoiceParamHeader, address: u64, flags: u32, count: u32, blocks: u64 };
+    var queue = Queue{ .header = .{ .size = @sizeOf(Queue), .next = 0, .id = 0x10000001 }, .address = @intFromPtr(&samples), .flags = 0, .count = 1, .blocks = @intFromPtr(&block) };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&queue)));
+    var command = [_]u64{ 0x0000040000000002, 1 };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    var first: [600 * 2]f32 = @splat(9);
+    var second: [600 * 2]f32 = @splat(9);
+    const buffers = [_]Ngs2RenderBuffer{
+        .{ .address = @intFromPtr(&first), .size = @sizeOf(@TypeOf(first)), .waveform_type = 0x18, .channels = 2 },
+        .{ .address = @intFromPtr(&second), .size = @sizeOf(@TypeOf(second)), .waveform_type = 0x18, .channels = 2 },
+    };
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 2));
+    try std.testing.expectEqualSlices(f32, &first, &second);
+    for (0..256) |frame| {
+        try std.testing.expectEqual(@as(f32, 0.25), first[frame * 2]);
+        try std.testing.expectEqual(@as(f32, -0.5), first[frame * 2 + 1]);
+    }
+    for (first[512..]) |sample| try std.testing.expectEqual(@as(f32, 9), sample);
+    var state: [56]u8 align(8) = undefined;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetState(voice, @intFromPtr(&state), state.len));
+    try std.testing.expectEqual(@as(u64, 256), std.mem.readInt(u64, state[24..32], .little));
+    try std.testing.expectEqual(@as(u64, 1024), std.mem.readInt(u64, state[32..40], .little));
+    try std.testing.expectEqual(@intFromPtr(&samples) + 1024, std.mem.readInt(u64, state[48..56], .little));
+    command[1] = 16;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 2));
+    for (first[0..512]) |sample| try std.testing.expectEqual(@as(f32, 0), sample);
+    command[1] = 32;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceRunCommands(voice, @intFromPtr(&command), 1, 0));
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&buffers), 2));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetState(voice, @intFromPtr(&state), state.len));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, state[0..4], .little));
+    try std.testing.expectEqual(@as(u64, 512), std.mem.readInt(u64, state[24..32], .little));
+    queue.count = 0;
+    queue.blocks = 0;
+    queue.flags = 4;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&queue)));
+}
+
+test "NGS2 decodes and mixes PCM waveforms used by sampler voices" {
+    reset();
+    defer reset();
+
+    var wave: [60]u8 = @splat(0);
+    @memcpy(wave[0..4], "RIFF");
+    std.mem.writeInt(u32, wave[4..8], wave.len - 8, .little);
+    @memcpy(wave[8..12], "WAVE");
+    @memcpy(wave[12..16], "fmt ");
+    std.mem.writeInt(u32, wave[16..20], 16, .little);
+    std.mem.writeInt(u16, wave[20..22], 1, .little);
+    std.mem.writeInt(u16, wave[22..24], 2, .little);
+    std.mem.writeInt(u32, wave[24..28], 48_000, .little);
+    std.mem.writeInt(u32, wave[28..32], 48_000 * 4, .little);
+    std.mem.writeInt(u16, wave[32..34], 4, .little);
+    std.mem.writeInt(u16, wave[34..36], 16, .little);
+    @memcpy(wave[36..40], "data");
+    std.mem.writeInt(u32, wave[40..44], 16, .little);
+    const pcm = [_]i16{ 32_767, -32_768, 16_384, -16_384, 8_192, -8_192, 0, 0 };
+    for (pcm, 0..) |sample, index| {
+        std.mem.writeInt(i16, wave[44 + index * 2 ..][0..2], sample, .little);
+    }
+
+    const decoded = ngs2DecodeWave(@intFromPtr(&wave)).?;
+    defer std.heap.page_allocator.free(decoded.samples);
+    try std.testing.expectEqual(@as(u32, 48_000), decoded.sample_rate);
+    try std.testing.expectEqual(@as(u8, 2), decoded.channels);
+    try std.testing.expectEqual(@as(usize, pcm.len), decoded.samples.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 32_767.0 / 32_768.0), decoded.samples[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), decoded.samples[1], 0.0001);
+
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 0, &voice));
+    var waveform = Ngs2VoiceWaveformParam{
+        .header = .{ .size = @sizeOf(Ngs2VoiceWaveformParam), .next = 0, .id = 0x1000_0001 },
+        .data_address = @intFromPtr(&wave),
+    };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&waveform)));
+
+    var output: [8]f32 = @splat(0);
+    const render = [_]Ngs2RenderBuffer{.{
+        .address = @intFromPtr(&output),
+        .size = @sizeOf(@TypeOf(output)),
+        .waveform_type = 0x18,
+        .channels = 2,
+    }};
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&render), render.len));
+    try std.testing.expectApproxEqAbs(@as(f32, 32_767.0 / 32_768.0), output[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), output[1], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), output[2], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), output[3], 0.0001);
+
+    @memset(&output, 0);
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&waveform)));
+    try std.testing.expectEqual(errno.ok, ngs2SystemRender(system, @intFromPtr(&render), render.len));
+    try std.testing.expectApproxEqAbs(@as(f32, 32_767.0 / 32_768.0), output[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1), output[1], 0.0001);
+
+    var compact_commands = [_]u64{ 0x0000_0400_0000_0002, 1, 0xd8, 0, 0, 0, 0, 0 };
+    try std.testing.expectEqual(
+        errno.ok,
+        ngs2VoiceRunCommands(voice, @intFromPtr(&compact_commands), 1, 0),
+    );
+
+    var second_voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 1, &second_voice));
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(second_voice, @intFromPtr(&waveform)));
+    ngs2_mutex.lock();
+    const first = ngs2FindVoice(voice).?;
+    const second = ngs2FindVoice(second_voice).?;
+    const first_cache = first.waveform_cache_index;
+    const second_cache = second.waveform_cache_index;
+    const first_samples = @intFromPtr(first.samples.ptr);
+    const second_samples = @intFromPtr(second.samples.ptr);
+    const references = ngs2_waveform_cache[first_cache.?].references;
+    ngs2_mutex.unlock();
+    try std.testing.expectEqual(first_cache, second_cache);
+    try std.testing.expectEqual(first_samples, second_samples);
+    try std.testing.expectEqual(@as(u16, 2), references);
+}
+
+test "NGS2 voice handles are stable and state flags preserve adjacent guest data" {
+    reset();
+    var system: u64 = 0;
+    var rack: u64 = 0;
+    var voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 7, &voice));
+    var same_voice: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(rack, 7, &same_voice));
+    try std.testing.expectEqual(voice, same_voice);
+
+    var event = Ngs2VoiceEventParam{
+        .header = .{ .size = @sizeOf(Ngs2VoiceEventParam), .next = 0, .id = 0x0006 },
+        .event_id = 0x0001,
+    };
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&event)));
+    ngs2_mutex.lock();
+    ngs2ApplyEventsLocked(system);
+    ngs2_mutex.unlock();
+
+    var result = extern struct {
+        flags: u32 = 0,
+        canary: u32 = 0xa5a5_5a5a,
+    }{};
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetStateFlags(voice, &result.flags));
+    try std.testing.expectEqual(@as(u32, 0x3), result.flags);
+    try std.testing.expectEqual(@as(u32, 0xa5a5_5a5a), result.canary);
+
+    event.event_id = 0x0010;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&event)));
+    ngs2_mutex.lock();
+    ngs2ApplyEventsLocked(system);
+    ngs2_mutex.unlock();
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetStateFlags(voice, &result.flags));
+    try std.testing.expectEqual(@as(u32, 0x5), result.flags);
+
+    event.event_id = 0x0004;
+    try std.testing.expectEqual(errno.ok, ngs2VoiceControl(voice, @intFromPtr(&event)));
+    ngs2_mutex.lock();
+    ngs2ApplyEventsLocked(system);
+    ngs2_mutex.unlock();
+    try std.testing.expectEqual(errno.ok, ngs2VoiceGetStateFlags(voice, &result.flags));
+    try std.testing.expectEqual(@as(u32, 0), result.flags);
+}
+
+test "AJM executes an MP3 decode job and reports actual PCM" {
+    reset();
+    var context: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInitialize(0, &context));
+    try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, 0, 0));
+    var instance: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, 0, 1, &instance));
+    var storage: [256]u8 = undefined;
+    var info = AjmBatchInfo{};
+    try std.testing.expectEqual(errno.ok, ajmBatchInitialize(&storage, storage.len, &info));
+    var frame: [417]u8 = @splat(0);
+    frame[0..4].* = .{ 0xff, 0xfb, 0x90, 0x64 };
+    var pcm: [4608]u8 = undefined;
+    var result = AjmDecodeResult{};
+    try std.testing.expectEqual(errno.ok, ajmBatchJobDecode(&info, instance, &frame, frame.len, &pcm, pcm.len, &result));
+    try std.testing.expectEqual(@as(i32, 0), result.result);
+    try std.testing.expectEqual(@as(i32, frame.len), result.size_consumed);
+    try std.testing.expect(result.size_produced > 0);
+    try std.testing.expectEqual(@as(u32, 1), result.number_of_frames);
+    var codec_info: [24]u8 = undefined;
+    try std.testing.expectEqual(errno.ok, ajmBatchJobGetCodecInfo(&info, instance, &codec_info, codec_info.len));
+    try std.testing.expectEqualSlices(u8, frame[0..4], codec_info[8..12]);
+    try std.testing.expectEqual(@as(u8, 0), codec_info[12]);
+    try std.testing.expectEqual(@as(u8, 1), codec_info[13]);
+}
+
+test "AJM accepts MPEG-4 AAC and Opus instances" {
+    reset();
+    var context: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInitialize(0, &context));
+    try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, ajm_codec.codec_m4aac, 0));
+    try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, ajm_codec.codec_opus, 0));
+    var aac: u32 = 0;
+    var opus: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, ajm_codec.codec_m4aac, 2, &aac));
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, ajm_codec.codec_opus, 2, &opus));
+    try std.testing.expect(aac != 0);
+    try std.testing.expect(opus != 0);
+    try std.testing.expectEqual(ajm_error_codec_not_supported, ajmModuleRegister(context, 3, 0));
+}
+
+test "AJM split decode joins input and scatters actual output" {
+    reset();
+    var context: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInitialize(0, &context));
+    try std.testing.expectEqual(errno.ok, ajmModuleRegister(context, ajm_codec.codec_mp3, 0));
+    var instance: u32 = 0;
+    try std.testing.expectEqual(errno.ok, ajmInstanceCreate(context, ajm_codec.codec_mp3, 1, &instance));
+
+    var storage: [256]u8 = undefined;
+    var info = AjmBatchInfo{};
+    try std.testing.expectEqual(errno.ok, ajmBatchInitialize(&storage, storage.len, &info));
+    var frame: [417]u8 = @splat(0);
+    frame[0..4].* = .{ 0xff, 0xfb, 0x90, 0x64 };
+    const inputs = [_]AjmBuffer{
+        .{ .address = frame[0..2].ptr, .size = 2 },
+        .{ .address = frame[2..].ptr, .size = frame.len - 2 },
+    };
+    var first: [1024]u8 = undefined;
+    var second: [3584]u8 = undefined;
+    const outputs = [_]AjmBuffer{
+        .{ .address = &first, .size = first.len },
+        .{ .address = &second, .size = second.len },
+    };
+    var result = AjmDecodeResult{};
+    try std.testing.expectEqual(
+        errno.ok,
+        ajmBatchJobDecodeSplit(&info, instance, &inputs, inputs.len, &outputs, outputs.len, &result),
+    );
+    try std.testing.expectEqual(@as(i32, 0), result.result);
+    try std.testing.expectEqual(@as(i32, frame.len), result.size_consumed);
+    try std.testing.expectEqual(@as(i32, first.len + second.len), result.size_produced);
+    try std.testing.expectEqual(@as(u32, 1), result.number_of_frames);
+}
+
+test "audio libraries register the title import surface" {
+    var db = symbols.Database{};
+    defer db.deinit(std.testing.allocator);
+    try register(&db, std.testing.allocator);
+    try std.testing.expect(db.findById("QOQtbeDqsT4", .function) != null);
+    try std.testing.expect(db.findById("aII9h5nli9U", .function) != null);
+    try std.testing.expect(db.findById("gatEUKG+Ea4", .function) != null);
+    try std.testing.expect(db.findById("39WxhR-ePew", .function) != null);
+    try std.testing.expect(db.findById("ekGJmmoc8j4", .function) != null);
+    try std.testing.expect(db.findById("gThZqM5PYlQ", .function) != null);
+    try std.testing.expect(db.findById("JXRC5n0RQls", .function) != null);
+    try std.testing.expect(db.findById("UOjiprYwVNw", .function) != null);
+    try std.testing.expect(db.findById("08JSg9p6bgQ", .function) != null);
+}
+
+test "NGS2 system lock rejects unknown handles" {
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2SystemLock(0x4e47_ffff));
+    try std.testing.expectEqual(errno.KernelError.einval.raw(), ngs2SystemUnlock(0x4e47_ffff));
+}
+
+test "AudioOut2 decodes formats and mixes ports to stereo correctly" {
+    const float_stereo = decodeAudioOut2Format(0x0200).?;
+    try std.testing.expectEqual(@as(u8, 2), float_stereo.channels);
+    try std.testing.expectEqual(@as(u8, 4), float_stereo.bytes_per_sample);
+    try std.testing.expect(float_stereo.is_float);
+
+    const int16_stereo = decodeAudioOut2Format(0x0201).?;
+    try std.testing.expectEqual(@as(u8, 2), int16_stereo.channels);
+    try std.testing.expectEqual(@as(u8, 2), int16_stereo.bytes_per_sample);
+    try std.testing.expect(!int16_stereo.is_float);
+
+    const float_71 = decodeAudioOut2Format(0x0800).?;
+    try std.testing.expectEqual(@as(u8, 8), float_71.channels);
+    try std.testing.expectEqual(@as(u8, 4), float_71.bytes_per_sample);
+    try std.testing.expect(float_71.is_float);
+
+    const frames: usize = 2;
+    var float_samples = [_]f32{ 0.5, -0.5, 0.25, -0.25 };
+    var mix: [4]f32 = @splat(0);
+    var peak: f32 = 0;
+    mixAudioOut2Port(
+        std.mem.sliceAsBytes(&float_samples),
+        &mix,
+        frames,
+        2,
+        4,
+        true,
+        false,
+        &peak,
+    );
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mix[0], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), mix[1], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), mix[2], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), mix[3], 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), peak, 0.001);
+}
+
+test "NGS2 full sampler rack leaves room for mastering and reuses destroyed voices" {
+    reset();
+    defer reset();
+    var system: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2SystemCreateWithAllocator(0, 0, &system));
+    var options: [176]u8 align(8) = @splat(0);
+    std.mem.writeInt(u64, options[0..8], options.len, .little);
+    std.mem.writeInt(u32, options[80..84], maximum_ngs2_voices, .little);
+    var sampler: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, @intFromPtr(&options), 0, &sampler));
+    var first: u64 = 0;
+    for (0..maximum_ngs2_voices) |i| {
+        var voice: u64 = 0;
+        try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(sampler, @intCast(i), &voice));
+        if (i == 0) first = voice;
+    }
+    var master_rack: u64 = 0;
+    var master: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x3000, 0, 0, &master_rack));
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(master_rack, 0, &master));
+    try std.testing.expect(first != master);
+    const slots = ngs2_voices.items.len;
+    try std.testing.expectEqual(maximum_ngs2_voices + 1, slots);
+    try std.testing.expectEqual(errno.ok, ngs2RackDestroy(sampler, 0));
+    try std.testing.expect(ngs2FindVoice(first) == null);
+    try std.testing.expect(ngs2FindVoice(master) != null);
+    try std.testing.expectEqual(errno.ok, ngs2RackCreateWithAllocator(system, 0x1000, 0, 0, &sampler));
+    var replacement: u64 = 0;
+    try std.testing.expectEqual(errno.ok, ngs2RackGetVoiceHandle(sampler, 0, &replacement));
+    try std.testing.expect(replacement != first);
+    try std.testing.expectEqual(slots, ngs2_voices.items.len);
+}

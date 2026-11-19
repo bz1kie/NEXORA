@@ -1,0 +1,35 @@
+name: Integrate NEXORA Vulkan frame sampler
+
+on:
+  push:
+    branches: [feature/nexora-build-baseline]
+    paths:
+      - 'tools/integrate_frame_sampler.py'
+      - '.github/workflows/nexora-integrate-sampler.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Apply checked Vulkan instrumentation
+        run: python3 tools/integrate_frame_sampler.py
+      - name: Commit instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- src/vulkan/backend.zig; then
+            echo "Instrumentation already present"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/vulkan/backend.zig
+          git commit -m "feat(vulkan): sample real guest flip intervals"
+          git push origin HEAD:feature/nexora-build-baseline

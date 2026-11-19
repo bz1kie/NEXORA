@@ -1,0 +1,663 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+
+//! Native Direct3D 12 device boundary. No Vulkan loader or translation driver
+//! participates in this path. A device must only be used by one submission
+//! thread at a time, and deinit must follow its last completed submission.
+const std = @import("std");
+const builtin = @import("builtin");
+pub const backend = @import("backend.zig");
+pub const Renderer = backend.Renderer;
+pub const graphics = @import("graphics.zig");
+pub const surfaces = @import("surfaces.zig");
+pub const staging = @import("staging.zig");
+pub const surface_cache = @import("surface_cache.zig");
+pub const blending = @import("blending.zig");
+pub const shader_cache = @import("shader_cache.zig");
+pub const texture_cache = @import("texture_cache.zig");
+
+test {
+    _ = backend;
+    _ = graphics;
+    _ = surfaces;
+    _ = staging;
+    _ = surface_cache;
+    _ = @import("resources.zig");
+    _ = blending;
+    _ = shader_cache;
+    _ = texture_cache;
+    _ = @import("ngg.zig");
+}
+
+const Handle = opaque {};
+pub const Buffer = extern struct {
+    bytes: [*]u8,
+    size: usize,
+
+    pub fn fromSlice(bytes: []u8) Buffer {
+        return .{ .bytes = bytes.ptr, .size = bytes.len };
+    }
+};
+/// A tightly packed, single-mip UAV. dimension: 0=2D, 1=2D array, 2=3D.
+pub const StorageImage = extern struct {
+    pixels: [*]u8,
+    size: usize,
+    width: u32,
+    height: u32,
+    layers: u32 = 1,
+    dimension: u32 = 0,
+    format: u32,
+    writable: u32 = 0,
+};
+
+pub const SampledImage = extern struct {
+    pixels: [*]const u8,
+    size: usize,
+    width: u32,
+    height: u32,
+    layers: u32 = 1,
+    /// 0: Texture2D, 1: TextureCubeArray, 2: Texture2DArray, 3: Texture3D.
+    /// For volumes, layers is depth and pixels are mip-major, then Z slices.
+    dimension: u32 = 0,
+    mip_levels: u32 = 1,
+    format: u32 = 28,
+    srgb: u32 = 0,
+    components: u32 = 5768,
+    filter: u32 = 0,
+    address_u: u32 = 3,
+    address_v: u32 = 3,
+    address_w: u32 = 3,
+    min_lod: f32 = 0,
+    max_lod: f32 = 16,
+    lod_bias: f32 = 0,
+    border: [4]f32 = @splat(0),
+    /// Nonzero for an immutable cached snapshot; equal IDs hold equal pixels.
+    content_id: u64 = 0,
+};
+pub const ColorAttachment = extern struct {
+    pixels: ?[*]u8 = null,
+    size: usize = 0,
+    format: u32 = 28,
+    write_mask: u32 = 15,
+    blend: blending.State = .{},
+};
+pub const Draw = extern struct {
+    width: u32,
+    height: u32,
+    vertex_count: u32 = 3,
+    instance_count: u32 = 1,
+    first_vertex: u32 = 0,
+    first_instance: u32 = 0,
+    topology: u32 = 4,
+    cull_mode: u32 = 1,
+    front_ccw: u32 = 0,
+    write_mask: u32 = 15,
+    index_count: u32 = 0,
+    index_element_bytes: u32 = 0,
+    primitive_restart: u32 = 0,
+    base_vertex: i32 = 0,
+    blend: blending.State = .{},
+    // Zero means no depth attachment; otherwise a native D16/D32 DSV.
+    depth_format: u32 = 0,
+    depth_write: u32 = 0,
+    depth_compare: u32 = 8,
+    depth_clip_enabled: u32 = 1,
+    depth_bias: f32 = 0,
+    depth_bias_clamp: f32 = 0,
+    depth_bias_slope: f32 = 0,
+    rectangle_completion: u32 = 0,
+    rectangle_mask: u32 = 0,
+    stencil: Stencil = .{},
+    stencil_pixels: ?[*]u8 = null,
+    stencil_bytes: usize = 0,
+    clear_flags: u32 = 0,
+    clear_depth: f32 = 0,
+    clear_stencil: u32 = 0,
+    viewport: [6]f32,
+    scissor: [4]i32,
+    // A separate read-only root SRV keeps per-draw SGPR values out of shaders.
+    dynamic_scalars: u32 = 0,
+    check_dispatcher: u32 = 0,
+    // Zero binds only a DSV, without allocating a dummy color surface.
+    color_attachment: u32 = 1,
+    color_format: u32 = 28,
+    // A full-volume RTV; layers are tightly packed Z slices in rgba.
+    color_depth: u32 = 1,
+    extra_color_count: u32 = 0,
+    extra_colors: [7]ColorAttachment = @splat(.{}),
+    scalar_values: [129]u32 = @splat(0),
+
+    pub fn fullTarget(width: u32, height: u32) Error!Draw {
+        _ = try rgbaSize(width, height);
+        return .{ .width = width, .height = height, .viewport = .{ 0, 0, @floatFromInt(width), @floatFromInt(height), 0, 1 }, .scissor = .{ 0, 0, @intCast(width), @intCast(height) } };
+    }
+};
+pub const Stencil = extern struct {
+    enabled: u32 = 0,
+    read_mask: u32 = 255,
+    write_mask: u32 = 0,
+    reference: u32 = 0,
+    // Native D3D12 op order: fail, depth fail, pass, compare.
+    front: [4]u32 = .{ 1, 1, 1, 8 },
+    back: [4]u32 = .{ 1, 1, 1, 8 },
+};
+pub const DeviceInfo = extern struct {
+    adapter: [128]u8,
+    dedicated_bytes: u64,
+    vendor_id: u32,
+    device_id: u32,
+    debug_enabled: u32,
+    shader_model: u32,
+    wave_ops: u32,
+    wave_lane_min: u32,
+    wave_lane_max: u32,
+
+    pub fn name(self: *const DeviceInfo) []const u8 {
+        return std.mem.sliceTo(&self.adapter, 0);
+    }
+};
+
+pub const Error = error{ UnsupportedPlatform, InvalidArgument, NativeFailure, ShaderLoopBudgetExceeded };
+
+// Native readback proofs need equality, not lexicographic ordering. Keep the
+// exact comparison on Zig's vector/word path rather than the CRT's memcmp.
+export fn ps5_d3d12_equal_bytes(a: [*]const u8, b: [*]const u8, size: usize) c_int {
+    return @intFromBool(std.mem.eql(u8, a[0..size], b[0..size]));
+}
+
+pub const AttachmentStats = extern struct {
+    enabled: u64 = 0,
+    color_hits: u64 = 0,
+    depth_hits: u64 = 0,
+    misses: u64 = 0,
+    avoided_bytes: u64 = 0,
+    pairs: u64 = 0,
+};
+pub const UploadStats = extern struct {
+    limit: u64 = 0,
+    bytes: u64 = 0,
+    buffer_hits: u64 = 0,
+    image_hits: u64 = 0,
+    misses: u64 = 0,
+    avoided_bytes: u64 = 0,
+    evictions: u64 = 0,
+    bypasses: u64 = 0,
+    content_hits: u64 = 0,
+};
+pub const ResourceStats = extern struct {
+    limit: u64 = 0,
+    bytes: u64 = 0,
+    entries: u64 = 0,
+    hits: u64 = 0,
+    misses: u64 = 0,
+    evictions: u64 = 0,
+    bypasses: u64 = 0,
+    create_ms: u64 = 0,
+};
+pub const CacheStats = extern struct {
+    enabled: u64 = 0,
+    shader_hits: u64 = 0,
+    shader_misses: u64 = 0,
+    shader_evictions: u64 = 0,
+    pipeline_hits: u64 = 0,
+    pipeline_misses: u64 = 0,
+    pipeline_evictions: u64 = 0,
+    shader_entries: u64 = 0,
+    pipeline_entries: u64 = 0,
+    shader_bytes: u64 = 0,
+    compile_ms: u64 = 0,
+    pipeline_ms: u64 = 0,
+};
+pub const Device = struct {
+    handle: *Handle,
+    info: DeviceInfo,
+
+    pub fn init(debug: bool) Error!Device {
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        var handle: ?*Handle = null;
+        var info: DeviceInfo = undefined;
+        var message: [1024]u8 = @splat(0);
+        const hr = ps5_d3d12_create(&handle, &info, @intFromBool(debug), &message, message.len);
+        if (hr < 0) {
+            std.log.err("[d3d12] {s} (0x{x})", .{ std.mem.sliceTo(&message, 0), @as(u32, @bitCast(hr)) });
+            return error.NativeFailure;
+        }
+        return .{ .handle = handle orelse return error.NativeFailure, .info = info };
+    }
+
+    pub fn deinit(self: *Device) void {
+        if (builtin.os.tag == .windows) ps5_d3d12_destroy(self.handle);
+        self.* = undefined;
+    }
+
+    fn check(self: *Device, hr: i32) Error!void {
+        if (hr >= 0) return;
+        std.log.err("[d3d12] {s} (0x{x})", .{ ps5_d3d12_error(self.handle), @as(u32, @bitCast(hr)) });
+        if (@as(u32, @bitCast(hr)) == 0x80040201) return error.ShaderLoopBudgetExceeded;
+        return error.NativeFailure;
+    }
+
+    pub fn bufferRoundtrip(self: *Device, source: []const u8, destination: []u8) Error!void {
+        if (source.len == 0 or source.len != destination.len) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_buffer_roundtrip(self.handle, source.ptr, destination.ptr, source.len));
+    }
+
+    pub fn computeProbe(self: *Device, destination: []u32, multiplier: u32, addend: u32) Error!void {
+        if (destination.len == 0 or destination.len > 65535 * 64) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_compute(self.handle, destination.ptr, @intCast(destination.len), multiplier, addend));
+    }
+
+    pub fn renderProbe(self: *Device, rgba: []u8, width: u32, height: u32) Error!void {
+        if (rgba.len != try rgbaSize(width, height)) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_render(self.handle, rgba.ptr, width, height));
+    }
+
+    pub fn attachWindow(self: *Device, hwnd: *anyopaque, width: u32, height: u32) Error!void {
+        _ = try rgbaSize(width, height);
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_attach_window(self.handle, hwnd, width, height));
+    }
+
+    pub fn presentColor(self: *Device, rgba: [4]f32) Error!void {
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        for (rgba) |component| if (!std.math.isFinite(component)) return error.InvalidArgument;
+        try self.check(ps5_d3d12_present(self.handle, &rgba));
+    }
+
+    pub fn validationErrors(self: *Device) u64 {
+        if (builtin.os.tag != .windows) return 0;
+        return ps5_d3d12_validation_errors(self.handle);
+    }
+
+    pub fn cacheStats(self: *Device) CacheStats {
+        var stats = CacheStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_cache_stats(self.handle, &stats);
+        return stats;
+    }
+
+    pub fn resourceStats(self: *Device) ResourceStats {
+        var stats = ResourceStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_resource_stats(self.handle, &stats);
+        return stats;
+    }
+
+    pub fn resourcePoolLimit(self: *Device, bytes: u64) Error!void {
+        if (bytes > 256 * 1024 * 1024) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_resource_pool_limit(self.handle, bytes));
+    }
+
+    pub fn uploadStats(self: *Device) UploadStats {
+        var stats = UploadStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_upload_stats(self.handle, &stats);
+        return stats;
+    }
+
+    pub fn attachmentStats(self: *Device) AttachmentStats {
+        var stats = AttachmentStats{};
+        if (builtin.os.tag == .windows) ps5_d3d12_attachment_stats(self.handle, &stats);
+        return stats;
+    }
+
+    pub fn attachmentCache(self: *Device, enabled: bool) Error!void {
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_attachment_cache(self.handle, @intFromBool(enabled)));
+    }
+
+    pub fn uploadCacheLimit(self: *Device, bytes: u64) Error!void {
+        if (bytes > 128 * 1024 * 1024) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_upload_cache_limit(self.handle, bytes));
+    }
+
+    /// Clears completed cached objects, retaining cumulative diagnostic counters.
+    pub fn cacheLimits(self: *Device, shaders: u32, pipelines: u32) Error!void {
+        if (shaders > 256 or pipelines > 512) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_cache_limits(self.handle, shaders, pipelines));
+    }
+
+    /// With `gds`, the last buffer is the persistent global data share bound
+    /// after the guest storage array; it is read back like the others.
+    pub fn dispatchSpirv(self: *Device, words: []const u32, buffers: []const Buffer, groups: [3]u32, gds: bool) Error!void {
+        return self.dispatchImagesSpirv(words, buffers, &.{}, groups, gds);
+    }
+
+    pub fn dispatchImagesSpirv(self: *Device, words: []const u32, buffers: []const Buffer, images: []const StorageImage, groups: [3]u32, gds: bool) Error!void {
+        return self.dispatchImagesSpirvChecked(words, buffers, images, groups, gds, false);
+    }
+
+    pub fn dispatchImagesSpirvChecked(self: *Device, words: []const u32, buffers: []const Buffer, images: []const StorageImage, groups: [3]u32, gds: bool, check_dispatcher: bool) Error!void {
+        return self.dispatchResourcesSpirv(words, buffers, images, &.{}, groups, gds, check_dispatcher);
+    }
+
+    pub fn dispatchResourcesSpirv(self: *Device, words: []const u32, buffers: []const Buffer, images: []const StorageImage, sampled: []const SampledImage, groups: [3]u32, gds: bool, check_dispatcher: bool) Error!void {
+        if (words.len < 5 or words[0] != 0x07230203 or buffers.len > 64 + @as(usize, @intFromBool(gds)) or (gds and buffers.len == 0)) return error.InvalidArgument;
+        for (groups) |size| if (size == 0 or size > 65535) return error.InvalidArgument;
+        for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        if (images.len > 32 or sampled.len > 32) return error.InvalidArgument;
+        try self.check(ps5_d3d12_dispatch_spirv(self.handle, words.ptr, words.len, buffers.ptr, @intCast(buffers.len), &groups, @intFromBool(gds), images.ptr, @intCast(images.len), @intFromBool(check_dispatcher), sampled.ptr, @intCast(sampled.len)));
+    }
+
+    pub fn drawSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, rgba: []u8) Error!void {
+        return self.drawIndexedSpirv(vertex, fragment, draw, &.{}, rgba);
+    }
+
+    pub fn drawIndexedSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, rgba: []u8) Error!void {
+        return self.drawResourcesSpirv(vertex, fragment, draw, indices, &.{}, &.{}, rgba);
+    }
+
+    pub fn drawResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8) Error!void {
+        return self.drawDepthResourcesSpirv(vertex, fragment, draw, indices, buffers, images, rgba, &.{});
+    }
+
+    pub fn drawDepthResourcesSpirv(self: *Device, vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8, depth: []u8) Error!void {
+        try validateDraw(vertex, fragment, draw, indices, buffers, images, rgba, depth);
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_draw_spirv(self.handle, vertex.ptr, vertex.len, fragment.ptr, fragment.len, &draw, indices.ptr, indices.len, buffers.ptr, @intCast(buffers.len), images.ptr, @intCast(images.len), rgba.ptr, depth.ptr, depth.len));
+    }
+
+    pub fn drawBatchSpirv(self: *Device, jobs: []const DrawJob, rgba: []u8, depth: []u8) Error!void {
+        if (jobs.len == 0 or jobs.len > max_draw_batch) return error.InvalidArgument;
+        var native_jobs: [max_draw_batch]NativeDrawJob = undefined;
+        for (jobs, native_jobs[0..jobs.len]) |*job, *out| {
+            if (job.draw.width != jobs[0].draw.width or job.draw.height != jobs[0].draw.height or
+                job.draw.depth_format != jobs[0].draw.depth_format or job.draw.color_attachment != jobs[0].draw.color_attachment or
+                job.draw.extra_color_count != jobs[0].draw.extra_color_count or job.draw.color_format != jobs[0].draw.color_format or job.draw.color_depth != jobs[0].draw.color_depth) return error.InvalidArgument;
+            try validateDraw(job.vertex, job.fragment, job.draw, job.indices, job.buffers, job.images, rgba, depth);
+            out.* = .{ .vertex = job.vertex.ptr, .vertex_count = job.vertex.len, .fragment = job.fragment.ptr, .fragment_count = job.fragment.len, .draw = &job.draw, .indices = job.indices.ptr, .index_bytes = job.indices.len, .buffers = job.buffers.ptr, .buffer_count = @intCast(job.buffers.len), .images = job.images.ptr, .image_count = @intCast(job.images.len) };
+        }
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_draw_batch(self.handle, &native_jobs, @intCast(jobs.len), rgba.ptr, depth.ptr, depth.len));
+    }
+
+    fn validateDraw(vertex: []const u32, fragment: []const u32, draw: Draw, indices: []const u8, buffers: []const Buffer, images: []const SampledImage, rgba: []u8, depth: []u8) Error!void {
+        if (draw.dynamic_scalars > 1 or draw.check_dispatcher > 1) return error.InvalidArgument;
+        if (draw.color_attachment > 1 or (draw.color_attachment == 0 and
+            (draw.depth_format == 0 or draw.write_mask != 0 or draw.blend.enabled != 0))) return error.InvalidArgument;
+        if (draw.extra_color_count > 7 or (draw.extra_color_count != 0 and draw.color_attachment == 0)) return error.InvalidArgument;
+        if (draw.color_depth == 0 or draw.color_depth > 2048 or (draw.color_depth > 1 and
+            (draw.width > 2048 or draw.height > 2048 or draw.depth_format != 0 or draw.color_attachment == 0))) return error.InvalidArgument;
+        const target_size = std.math.mul(usize, try colorSize(draw.width, draw.height, draw.color_format), draw.color_depth) catch return error.InvalidArgument;
+        if (target_size > 256 * 1024 * 1024) return error.InvalidArgument;
+        for (draw.extra_colors[0..draw.extra_color_count]) |color| {
+            const extra_size = std.math.mul(usize, try colorSize(draw.width, draw.height, color.format), draw.color_depth) catch return error.InvalidArgument;
+            if (color.pixels == null or color.size != extra_size or extra_size > 256 * 1024 * 1024 or
+                color.write_mask > 15 or !color.blend.valid() or !std.meta.eql(color.blend.constants, draw.blend.constants)) return error.InvalidArgument;
+        }
+        for (draw.extra_colors[0..draw.extra_color_count], 0..) |color, i| {
+            const start = @intFromPtr(color.pixels.?);
+            const end = std.math.add(usize, start, color.size) catch return error.InvalidArgument;
+            for ([_][]const u8{ rgba, depth, if (draw.stencil_pixels) |p| p[0..draw.stencil_bytes] else &.{} }) |plane| {
+                if (plane.len != 0 and start < @intFromPtr(plane.ptr) +| plane.len and @intFromPtr(plane.ptr) < end) return error.InvalidArgument;
+            }
+            for (draw.extra_colors[0..i]) |other| {
+                if (start < @intFromPtr(other.pixels.?) +| other.size and @intFromPtr(other.pixels.?) < end) return error.InvalidArgument;
+            }
+        }
+        if (depth.len != try depthSize(draw.width, draw.height, draw.depth_format) or draw.depth_write > 1 or draw.depth_clip_enabled > 1 or
+            draw.depth_compare < 1 or draw.depth_compare > 8 or (draw.depth_format == 0 and draw.depth_write != 0)) return error.InvalidArgument;
+        if (!draw.blend.valid()) return error.InvalidArgument;
+        if (buffers.len > 64 or images.len > 32) return error.InvalidArgument;
+        for (buffers) |buffer| if (buffer.size == 0 or buffer.size % 4 != 0 or buffer.size > 256 * 1024 * 1024) return error.InvalidArgument;
+        for (images) |image| {
+            if (image.size != try sampledImageMipChainSize(image.width, image.height, image.format, image.layers, image.dimension, image.mip_levels) or image.srgb > 1 or
+                ((image.format == 10 or image.format == 24 or image.format == 54 or image.format == 41 or image.format == 34 or image.format == 56 or image.format == 61 or image.format == 49 or image.format == 115 or image.format == 95 or image.format == 96) and image.srgb != 0) or
+                image.address_u < 1 or image.address_u > 5 or image.address_v < 1 or image.address_v > 5 or
+                image.address_w < 1 or image.address_w > 5 or image.filter & ~@as(u32, 0x15) != 0 or
+                !std.math.isFinite(image.min_lod) or !std.math.isFinite(image.max_lod) or !std.math.isFinite(image.lod_bias) or
+                image.min_lod > image.max_lod) return error.InvalidArgument;
+        }
+        if (draw.index_count != 0) {
+            if ((draw.index_element_bytes != 2 and draw.index_element_bytes != 4) or
+                @as(u64, draw.index_count) * draw.index_element_bytes != indices.len or indices.len > 64 * 1024 * 1024) return error.InvalidArgument;
+        } else if (indices.len != 0 or draw.index_element_bytes != 0 or draw.primitive_restart != 0) return error.InvalidArgument;
+        if (draw.primitive_restart > 1 or (draw.primitive_restart != 0 and draw.topology != 5)) return error.InvalidArgument;
+        const color_bytes = if (draw.color_attachment != 0) target_size else 0;
+        if (rgba.len != color_bytes or vertex.len < 5 or fragment.len < 5 or
+            vertex[0] != 0x07230203 or fragment[0] != 0x07230203 or (draw.vertex_count == 0 and draw.index_count == 0) or draw.instance_count == 0 or
+            (draw.topology != 4 and draw.topology != 5) or draw.cull_mode < 1 or draw.cull_mode > 3 or draw.write_mask > 15) return error.InvalidArgument;
+        for (draw.viewport) |value| if (!std.math.isFinite(value)) return error.InvalidArgument;
+        if (!std.math.isFinite(draw.depth_bias) or !std.math.isFinite(draw.depth_bias_clamp) or !std.math.isFinite(draw.depth_bias_slope)) return error.InvalidArgument;
+        if (draw.viewport[2] <= 0 or draw.viewport[3] <= 0 or draw.viewport[4] < 0 or draw.viewport[5] > 1 or draw.viewport[4] > draw.viewport[5] or
+            draw.scissor[0] < 0 or draw.scissor[1] < 0 or draw.scissor[2] < draw.scissor[0] or draw.scissor[3] < draw.scissor[1]) return error.InvalidArgument;
+    }
+
+    pub fn presentRgba(self: *Device, rgba: []const u8, width: u32, height: u32) Error!void {
+        if (rgba.len != try rgbaSize(width, height)) return error.InvalidArgument;
+        if (builtin.os.tag != .windows) return error.UnsupportedPlatform;
+        try self.check(ps5_d3d12_present_rgba(self.handle, rgba.ptr, width, height));
+    }
+};
+
+pub const max_draw_batch = 64;
+pub const DrawJob = struct {
+    vertex: []const u32,
+    fragment: []const u32,
+    draw: Draw,
+    indices: []const u8 = &.{},
+    buffers: []const Buffer = &.{},
+    images: []const SampledImage = &.{},
+};
+const NativeDrawJob = extern struct {
+    vertex: [*]const u32,
+    vertex_count: usize,
+    fragment: [*]const u32,
+    fragment_count: usize,
+    draw: *const Draw,
+    indices: [*]const u8,
+    index_bytes: usize,
+    buffers: [*]const Buffer,
+    buffer_count: u32,
+    images: [*]const SampledImage,
+    image_count: u32,
+};
+extern fn ps5_d3d12_draw_batch(*Handle, [*]const NativeDrawJob, u32, [*]u8, [*]u8, usize) i32;
+
+pub fn rgbaSize(width: u32, height: u32) Error!usize {
+    if (width == 0 or height == 0 or width > 16384 or height > 16384) return error.InvalidArgument;
+    return @as(usize, width) * height * 4;
+}
+
+pub fn colorSize(width: u32, height: u32, format: u32) Error!usize {
+    const rgba = try rgbaSize(width, height);
+    const size = switch (format) {
+        10 => rgba * 2, // R16G16B16A16_FLOAT
+        2 => rgba * 4, // R32G32B32A32_FLOAT
+        61 => rgba / 4, // R8_UNORM
+        24, 26, 28, 29, 31, 34 => rgba,
+        else => return error.InvalidArgument,
+    };
+    if (size > 256 * 1024 * 1024) return error.InvalidArgument;
+    return size;
+}
+
+// Sampled atlases can exceed the framebuffer budget (16K BC7 plus mip tail).
+pub const max_sampled_image_bytes = 512 * 1024 * 1024;
+
+pub fn isBlockCompressedFormat(format: u32) bool {
+    return format == 71 or format == 74 or format == 77 or format == 95 or format == 96 or format == 98;
+}
+
+pub fn sampledImageMipChainSize(width: u32, height: u32, format: u32, layers: u32, dimension: u32, mip_levels: u32) Error!usize {
+    var total = try sampledImageArraySize(width, height, format, layers, dimension);
+    const extent = @max(@max(width, height), if (dimension == 3) layers else 1);
+    if (mip_levels == 0 or mip_levels > 15 or mip_levels > 1 + std.math.log2_int(u32, extent)) return error.InvalidArgument;
+    // Guest placement uses ceil dimensions while native mip extents floor.
+    // Check the selected chain, not whether the base is a power of two: a
+    // 96x32 view with four levels ends at 12x4 and matches exactly.
+    const compressed = isBlockCompressedFormat(format);
+    for (1..mip_levels) |level| {
+        const divisor = @as(u32, 1) << @as(u5, @intCast(level));
+        if ((width + divisor - 1) / divisor != @max(1, width / divisor) or
+            (height + divisor - 1) / divisor != @max(1, height / divisor) or
+            (dimension == 3 and (layers + divisor - 1) / divisor != @max(1, layers / divisor))) return error.InvalidArgument;
+        const w = @max(if (compressed) @as(u32, 4) else 1, width >> @as(u5, @intCast(level)));
+        const h = @max(if (compressed) @as(u32, 4) else 1, height >> @as(u5, @intCast(level)));
+        const depth = if (dimension == 3) @max(1, layers >> @as(u5, @intCast(level))) else layers;
+        total += (try sampledImageSize(w, h, format)) * depth;
+    }
+    if (total > max_sampled_image_bytes) return error.InvalidArgument;
+    return total;
+}
+
+pub fn sampledImageArraySize(width: u32, height: u32, format: u32, layers: u32, dimension: u32) Error!usize {
+    if (layers == 0 or layers > 2048 or dimension > 3 or (dimension == 0 and layers != 1) or
+        (dimension == 3 and (width > 2048 or height > 2048 or isBlockCompressedFormat(format))) or
+        (dimension == 1 and (width != height or layers % 6 != 0))) return error.InvalidArgument;
+    const size = std.math.mul(usize, try sampledImageSize(width, height, format), layers) catch return error.InvalidArgument;
+    if (size > max_sampled_image_bytes) return error.InvalidArgument;
+    return size;
+}
+
+pub fn sampledImageSize(width: u32, height: u32, format: u32) Error!usize {
+    const rgba = try rgbaSize(width, height);
+    if (format == 28 or format == 24 or format == 41 or format == 34 or format == 26 or
+        format == 35 or format == 37 or format == 31) return rgba;
+    if (format == 10) return colorSize(width, height, format);
+    if (format == 11 or format == 13 or format == 16) return rgba * 2;
+    if (format == 2) return rgba * 4;
+    if (format == 61 or format == 63) return rgba / 4;
+    if (format == 56 or format == 54 or format == 49 or format == 115 or format == 58 or format == 51) return rgba / 2;
+    // Native BC base dimensions must be whole 4x4 blocks. Smaller mip levels
+    // will need a separate subresource path; never pad and change guest UVs.
+    if (width % 4 != 0 or height % 4 != 0) return error.InvalidArgument;
+    const bytes: usize = switch (format) {
+        71 => 8, // BC1_UNORM
+        74, 77, 95, 96, 98 => 16, // BC2 / BC3 / BC6H unsigned/signed HDR / BC7
+        else => return error.InvalidArgument,
+    };
+    return @as(usize, width / 4) * (height / 4) * bytes;
+}
+
+pub fn depthSize(width: u32, height: u32, format: u32) Error!usize {
+    const bytes = try rgbaSize(width, height);
+    return switch (format) {
+        0 => 0,
+        40 => bytes, // D32_FLOAT
+        55 => bytes / 2, // D16_UNORM
+        else => error.InvalidArgument,
+    };
+}
+
+extern fn ps5_d3d12_create(*?*Handle, *DeviceInfo, c_int, [*]u8, usize) i32;
+extern fn ps5_d3d12_destroy(*Handle) void;
+extern fn ps5_d3d12_error(*Handle) [*:0]const u8;
+extern fn ps5_d3d12_buffer_roundtrip(*Handle, [*]const u8, [*]u8, usize) i32;
+extern fn ps5_d3d12_compute(*Handle, [*]u32, u32, u32, u32) i32;
+extern fn ps5_d3d12_render(*Handle, [*]u8, u32, u32) i32;
+extern fn ps5_d3d12_attach_window(*Handle, *anyopaque, u32, u32) i32;
+extern fn ps5_d3d12_present(*Handle, *const [4]f32) i32;
+extern fn ps5_d3d12_validation_errors(*Handle) u64;
+extern fn ps5_d3d12_cache_stats(*Handle, *CacheStats) void;
+extern fn ps5_d3d12_cache_limits(*Handle, u32, u32) i32;
+extern fn ps5_d3d12_resource_stats(*Handle, *ResourceStats) void;
+extern fn ps5_d3d12_upload_stats(*Handle, *UploadStats) void;
+extern fn ps5_d3d12_attachment_stats(*Handle, *AttachmentStats) void;
+extern fn ps5_d3d12_attachment_cache(*Handle, c_int) i32;
+extern fn ps5_d3d12_upload_cache_limit(*Handle, u64) i32;
+extern fn ps5_d3d12_resource_pool_limit(*Handle, u64) i32;
+extern fn ps5_d3d12_dispatch_spirv(*Handle, [*]const u32, usize, [*]const Buffer, u32, *const [3]u32, u32, [*]const StorageImage, u32, u32, [*]const SampledImage, u32) i32;
+extern fn ps5_d3d12_draw_spirv(*Handle, [*]const u32, usize, [*]const u32, usize, *const Draw, [*]const u8, usize, [*]const Buffer, u32, [*]const SampledImage, u32, [*]u8, [*]u8, usize) i32;
+extern fn ps5_d3d12_present_rgba(*Handle, [*]const u8, u32, u32) i32;
+
+test "readback sizes reject empty and excessive textures before native allocation" {
+    try std.testing.expectEqual(@as(usize, 71 * 37 * 4), try rgbaSize(71, 37));
+    try std.testing.expectError(error.InvalidArgument, rgbaSize(0, 1));
+    try std.testing.expectError(error.InvalidArgument, rgbaSize(1, 0));
+    try std.testing.expectError(error.InvalidArgument, rgbaSize(16385, 1));
+    try std.testing.expectError(error.InvalidArgument, rgbaSize(1, std.math.maxInt(u32)));
+}
+
+test "depth footprints accept only native D16 and D32 planes" {
+    try std.testing.expectEqual(@as(usize, 0), try depthSize(65, 37, 0));
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 2), try depthSize(65, 37, 55));
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 4), try depthSize(65, 37, 40));
+    try std.testing.expectError(error.InvalidArgument, depthSize(65, 37, 45));
+    try std.testing.expectError(error.InvalidArgument, depthSize(0, 37, 40));
+}
+
+test "color footprints preserve half-float storage and reject undersized draw buffers" {
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 8), try colorSize(65, 37, 10));
+    try std.testing.expectEqual(@as(usize, 65 * 37 * 8), try sampledImageSize(65, 37, 10));
+    try std.testing.expectError(error.InvalidArgument, colorSize(16384, 16384, 10));
+    try std.testing.expectError(error.InvalidArgument, colorSize(65, 37, 11));
+    var draw = try Draw.fullTarget(1, 1);
+    draw.color_format = 10;
+    const module = [_]u32{ 0x07230203, 0, 0, 0, 0 };
+    var pixels: [8]u8 = @splat(0);
+    try Device.validateDraw(&module, &module, draw, &.{}, &.{}, &.{}, &pixels, &.{});
+    try std.testing.expectError(error.InvalidArgument, Device.validateDraw(&module, &module, draw, &.{}, &.{}, &.{}, pixels[0..4], &.{}));
+}
+
+test "volume footprints shrink depth per mip and bound native 3D formats" {
+    try std.testing.expectEqual(@as(usize, 300), try sampledImageMipChainSize(8, 4, 28, 2, 3, 4));
+    try std.testing.expectEqual(@as(usize, 60), try sampledImageMipChainSize(1, 1, 28, 8, 3, 4));
+    try std.testing.expectEqual(@as(usize, 840), try sampledImageMipChainSize(5, 3, 10, 7, 3, 1));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 4, 28, 7, 3, 2));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 4, 71, 2, 3, 1));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(4096, 1, 28, 1, 3, 1));
+}
+
+test "sampled BC footprints count blocks and reject unsupported native extents" {
+    try std.testing.expectEqual(@as(usize, 13 * 9 * 2), try sampledImageSize(13, 9, 56));
+    try std.testing.expectEqual(@as(usize, 3 * 7), try sampledImageSize(3, 7, 61));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 49));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 115));
+    try std.testing.expectEqual(@as(usize, 2), try sampledImageSize(1, 1, 115));
+    try std.testing.expectEqual(@as(usize, 256 * 128 * 2), try sampledImageSize(256, 128, 115));
+    try std.testing.expectEqual(@as(usize, 8192), try sampledImageSize(128, 128, 71));
+    try std.testing.expectEqual(@as(usize, 16384), try sampledImageSize(128, 128, 77));
+    try std.testing.expectEqual(@as(usize, 32), try sampledImageSize(8, 4, 74));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 28));
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(127, 128, 77));
+    try std.testing.expectEqual(@as(usize, 16), try sampledImageSize(4, 4, 98));
+    try std.testing.expectEqual(@as(usize, 0x0aaaaac0), try sampledImageMipChainSize(16384, 8192, 98, 1, 0, 14));
+    try std.testing.expectEqual(@as(usize, 0x15555560), try sampledImageMipChainSize(16384, 16384, 98, 1, 0, 14));
+    try std.testing.expectEqual(@as(usize, 0x15555570), try sampledImageMipChainSize(16384, 16384, 98, 1, 0, 15));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(16384, 16384, 98, 2, 2, 15));
+    try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(8, 8, 98, 4, 3));
+    for ([_]u32{ 95, 96 }) |format| {
+        try std.testing.expectEqual(@as(usize, 16), try sampledImageSize(4, 4, format));
+        try std.testing.expectEqual(@as(usize, 524448), try sampledImageMipChainSize(256, 256, format, 6, 1, 9));
+        try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(8, 8, format, 4, 3));
+    }
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(4, 4, 94)); // Typeless needs an explicit view.
+    try std.testing.expectError(error.InvalidArgument, sampledImageSize(16388, 4, 71));
+    // Signed and wider UNORM/float texels keep their native byte widths.
+    try std.testing.expectEqual(@as(usize, 3 * 7), try sampledImageSize(3, 7, 63));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 58));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 2), try sampledImageSize(3, 7, 51));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 35));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 37));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 4), try sampledImageSize(3, 7, 31));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 8), try sampledImageSize(3, 7, 11));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 8), try sampledImageSize(3, 7, 13));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 8), try sampledImageSize(3, 7, 16));
+    try std.testing.expectEqual(@as(usize, 3 * 7 * 16), try sampledImageSize(3, 7, 2));
+}
+
+test "sampled arrays validate shape layers and bounded storage" {
+    try std.testing.expectEqual(@as(usize, 8 * 8 * 4 * 12), try sampledImageArraySize(8, 8, 28, 12, 1));
+    try std.testing.expectEqual(@as(usize, 8 * 8 / 2 * 6), try sampledImageArraySize(8, 8, 71, 6, 1));
+    try std.testing.expectEqual(@as(usize, 13 * 9 * 3), try sampledImageArraySize(13, 9, 61, 3, 2));
+    for ([_][5]u32{
+        .{ 8, 8, 28, 0, 2 },         .{ 8, 8, 28, 2049, 2 }, .{ 8, 8, 28, 2, 0 },
+        .{ 8, 4, 28, 6, 1 },         .{ 8, 8, 28, 7, 1 },    .{ 8, 8, 28, 1, 4 },
+        .{ 16384, 16384, 28, 6, 1 },
+    }) |shape| try std.testing.expectError(error.InvalidArgument, sampledImageArraySize(shape[0], shape[1], shape[2], shape[3], shape[4]));
+}
+
+test "sampled mip chains include every layer and the smallest compressed blocks" {
+    try std.testing.expectEqual(@as(usize, 1702272), try sampledImageMipChainSize(64, 64, 28, 78, 2, 5));
+    try std.testing.expectEqual(@as(usize, 336), try sampledImageMipChainSize(8, 8, 71, 6, 1, 4));
+    try std.testing.expectEqual(@as(usize, 32640), try sampledImageMipChainSize(96, 32, 28, 2, 2, 4));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(96, 32, 28, 2, 2, 7));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 8, 28, 1, 0, 5));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(13, 8, 28, 1, 0, 3));
+    try std.testing.expectError(error.InvalidArgument, sampledImageMipChainSize(8, 8, 28, 1, 0, 0));
+}

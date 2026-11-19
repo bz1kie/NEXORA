@@ -1,0 +1,46 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Artur Strazewicz
+.{
+    .name = .rdna2,
+    .version = "0.3.6",
+    .fingerprint = 0x70cc9aa6f444796,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .spirv_cross = .{
+            .url = "https://github.com/KhronosGroup/SPIRV-Cross/archive/a0fba56c34a6700f1724bf9b751da5b488a3775c.tar.gz",
+            .hash = "N-V-__8AAHmjuACJQQj6LAdUGiH_9UXgzBdEV3OZYRBHlemv",
+        },
+        .freetype = .{
+            .url = "https://github.com/freetype/freetype/archive/refs/tags/VER-2-14-3.tar.gz",
+            .hash = "N-V-__8AAGJsqgDtM-7hGxs3GiSanZStnUfFiuHmioYRK3hN",
+        },
+        .libatrac9 = .{
+            .url = "https://github.com/shadps4-emu/ext-LibAtrac9/archive/946e05a9212976626a9f5e52f29c0a7202871f29.tar.gz",
+            .hash = "N-V-__8AACDxBADvLCQVTh9mzhuIbwV2zj1QXzdDWXU8J1ZZ",
+        },
+        .minimp3 = .{
+            .url = "https://github.com/lieff/minimp3/archive/7b590fdcfa5a79c033e76eacc05d0c3e4c79f536.tar.gz",
+            .hash = "N-V-__8AAITPDQK9zXacGDpSmTu7XxdPQyDUWldJBmJHdXWU",
+        },
+        .faad2 = .{
+            .url = "https://github.com/knik0/faad2/archive/refs/tags/2.11.2.tar.gz",
+            .hash = "N-V-__8AAPI-KQB4wWupmQ5-EPOUT1qm1y6eufl5DnyO4T9B",
+        },
+        .libopus = .{
+            .url = "https://github.com/xiph/opus/archive/refs/tags/v1.5.2.tar.gz",
+            .hash = "N-V-__8AAMEO5AA16T-SYUVA1ipB1ctBxSMowU_ZD3tzi54M",
+        },
+        .dxc = .{
+            .url = "https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip",
+            .hash = "N-V-__8AACP-kgSZh1qulwC-DRK3yDN0CtQpknS5km4LpcqB",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
