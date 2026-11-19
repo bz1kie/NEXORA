@@ -5,6 +5,7 @@ on:
     branches: [feature/nexora-build-baseline]
     paths:
       - 'tools/integrate_frame_sampler.py'
+      - '.github/workflows/nexora-integrate-sampler.yml'
   workflow_dispatch:
 
 permissions:
