@@ -1553,3 +1553,17 @@ test "pump report counts completed submission and final no-progress pass" {
     try testing.expectEqual(@as(usize, 1), report.no_progress_iterations);
     try testing.expectEqual(@as(usize, 1), host.event_count);
 }
+
+test "pump totals accumulate across calls without double counting" {
+    var host = FakeBackend{};
+    var scheduler = Scheduler.init(testing.allocator, host.interface());
+    defer scheduler.deinit();
+    const first = try scheduler.pump();
+    const stream = [_]u32{ command(pm4.event_write, 1), 0x21 };
+    const second = try scheduler.submit(.graphics, &stream);
+    const totals = scheduler.pumpTotals();
+    try testing.expectEqual(first.pump_iterations + second.pump_iterations, totals.pump_iterations);
+    try testing.expectEqual(first.no_progress_iterations + second.no_progress_iterations, totals.no_progress_iterations);
+    try testing.expectEqual(@as(usize, 1), totals.completed_submissions);
+    try testing.expectEqual(@as(usize, 1), host.event_count);
+}
