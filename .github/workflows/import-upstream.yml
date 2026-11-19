@@ -1,0 +1,26 @@
+name: Import upstream PS5PCEM history
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  import-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch upstream history without executing upstream code
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init nexora-import
+          cd nexora-import
+          git remote add upstream https://github.com/iStark/PS5PCEM.git
+          git fetch --no-tags upstream refs/heads/main:refs/remotes/upstream/main
+          git remote add nexora "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          # Never force-push or overwrite an existing import branch.
+          git push nexora refs/remotes/upstream/main:refs/heads/import/ps5pcem-upstream
+          echo "Imported upstream main into import/ps5pcem-upstream"
